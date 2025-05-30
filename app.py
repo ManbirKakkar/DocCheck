@@ -18,7 +18,7 @@ import difflib
 import platform
 import sys
 import html
-import mammoth  # For DOC to DOCX conversion
+import subprocess  # For DOC to DOCX conversion
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -56,20 +56,36 @@ def create_output_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
     return path
 
-def convert_doc_to_docx(doc_bytes):
-    """Convert DOC file to DOCX format using mammoth"""
+def convert_doc_to_docx(doc_path):
+    """Convert DOC file to DOCX format using LibreOffice"""
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as tmp_doc:
-            tmp_doc.write(doc_bytes)
-            tmp_doc_path = tmp_doc.name
+        # Create temp output directory
+        output_dir = tempfile.mkdtemp()
+        output_path = os.path.join(output_dir, "converted.docx")
         
-        # Convert to DOCX
-        with open(tmp_doc_path, "rb") as doc_file:
-            result = mammoth.convert_to_docx(doc_file)
-            docx_bytes = result.value
+        # Run LibreOffice conversion
+        cmd = [
+            "libreoffice",
+            "--headless",
+            "--convert-to",
+            "docx",
+            "--outdir",
+            output_dir,
+            doc_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            st.error(f"DOC to DOCX conversion failed: {result.stderr}")
+            return None
+        
+        # Read converted file
+        with open(output_path, "rb") as f:
+            docx_bytes = f.read()
         
         # Clean up
-        os.unlink(tmp_doc_path)
+        shutil.rmtree(output_dir)
         return docx_bytes
     except Exception as e:
         st.error(f"DOC to DOCX conversion failed: {str(e)}")
@@ -310,11 +326,11 @@ def highlight_differences(text1, text2):
 def batch_processing_page():
     st.title("📄 Batch Processing")
     st.markdown("""
-    ### Process multiple DOCX/DOC files with pattern replacement:
+    ### Process multiple DOCX files with pattern replacement:
     - Upload multiple files at once
     - Process all files in a single operation
     - Each file processed independently
-    - .DOC files will be converted to .DOCX automatically
+    - .DOC files are not currently supported
     """)
     
     # Dependencies note
@@ -327,7 +343,7 @@ def batch_processing_page():
            - **Linux**: `sudo apt install tesseract-ocr`
         2. Install Python dependencies:
            ```bash
-           pip install opencv-python pytesseract numpy python-docx mammoth
+           pip install opencv-python pytesseract numpy
            ```
         """)
         
@@ -345,8 +361,8 @@ def batch_processing_page():
     # File upload section
     with st.expander("📤 Upload Documents", expanded=True):
         uploaded_files = st.file_uploader(
-            "Select DOCX or DOC files", 
-            type=['docx', 'doc'],
+            "Select DOCX files", 
+            type=['docx'],
             help="Documents containing number patterns (e.g., 77-xxx-xxxxxxx-xx)",
             accept_multiple_files=True
         )
@@ -396,26 +412,7 @@ def batch_processing_page():
                 
                 # Save uploaded file to temp location
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
-                    file_bytes = uploaded_file.getbuffer()
-                    
-                    # Convert DOC to DOCX if needed
-                    if original_name.lower().endswith('.doc'):
-                        docx_bytes = convert_doc_to_docx(file_bytes)
-                        if docx_bytes:
-                            tmp_file.write(docx_bytes)
-                        else:
-                            # Skip processing if conversion failed
-                            results.append({
-                                'file': original_name,
-                                'status': '❌ Error: DOC to DOCX conversion failed',
-                                'time': '0:00:00',
-                                'path': '',
-                                'processed_name': ''
-                            })
-                            continue
-                    else:
-                        tmp_file.write(file_bytes)
-                    
+                    tmp_file.write(uploaded_file.getbuffer())
                     tmp_path = tmp_file.name
                 
                 # Create progress callback for individual file
@@ -532,64 +529,28 @@ def compare_document_pair(original_file, processed_file):
     with st.spinner(f"Comparing {original_file.name} and {processed_file.name}..."):
         # Prepare original file
         orig_bytes = original_file.getbuffer()
-        orig_is_doc = original_file.name.lower().endswith('.doc')
         
         # Prepare processed file
         proc_bytes = processed_file.getbuffer()
-        proc_is_doc = processed_file.name.lower().endswith('.doc')
         
         try:
-            # Handle original file conversion if needed
-            orig_docx_path = None
-            if orig_is_doc:
-                docx_bytes = convert_doc_to_docx(orig_bytes)
-                if not docx_bytes:
-                    return {
-                        'original': original_file.name,
-                        'processed': processed_file.name,
-                        'text_diff': "",
-                        'orig_images': [],
-                        'proc_images': [],
-                        'error': "DOC to DOCX conversion failed for original file"
-                    }
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
-                    tmp_file.write(docx_bytes)
-                    orig_docx_path = tmp_file.name
-            else:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
-                    tmp_file.write(orig_bytes)
-                    orig_docx_path = tmp_file.name
+            # Save original file to temp location
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as orig_tmp:
+                orig_tmp.write(orig_bytes)
+                orig_path = orig_tmp.name
             
-            # Handle processed file conversion if needed
-            proc_docx_path = None
-            if proc_is_doc:
-                docx_bytes = convert_doc_to_docx(proc_bytes)
-                if not docx_bytes:
-                    return {
-                        'original': original_file.name,
-                        'processed': processed_file.name,
-                        'text_diff': "",
-                        'orig_images': [],
-                        'proc_images': [],
-                        'error': "DOC to DOCX conversion failed for processed file"
-                    }
-                
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
-                    tmp_file.write(docx_bytes)
-                    proc_docx_path = tmp_file.name
-            else:
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
-                    tmp_file.write(proc_bytes)
-                    proc_docx_path = tmp_file.name
+            # Save processed file to temp location
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as proc_tmp:
+                proc_tmp.write(proc_bytes)
+                proc_path = proc_tmp.name
             
             # Extract text from both documents
-            orig_text = extract_text_from_docx(orig_docx_path)
-            proc_text = extract_text_from_docx(proc_docx_path)
+            orig_text = extract_text_from_docx(orig_path)
+            proc_text = extract_text_from_docx(proc_path)
             
             # Extract images from both documents
-            orig_images = extract_images_from_docx(orig_docx_path)
-            proc_images = extract_images_from_docx(proc_docx_path)
+            orig_images = extract_images_from_docx(orig_path)
+            proc_images = extract_images_from_docx(proc_path)
             
             # Create visual diff
             html_diff = highlight_differences(orig_text, proc_text)
@@ -615,19 +576,18 @@ def compare_document_pair(original_file, processed_file):
             
         finally:
             # Clean up temp files
-            if orig_docx_path and os.path.exists(orig_docx_path):
-                os.unlink(orig_docx_path)
-            if proc_docx_path and os.path.exists(proc_docx_path):
-                os.unlink(proc_docx_path)
+            if os.path.exists(orig_path):
+                os.unlink(orig_path)
+            if os.path.exists(proc_path):
+                os.unlink(proc_path)
 
 def comparison_page():
     st.title("🔍 Batch Document Comparison")
     st.markdown("""
-    ### Compare multiple original and processed DOCX/DOC files:
+    ### Compare multiple original and processed DOCX files:
     - Upload sets of original and processed files
     - Files are automatically matched by filename
     - See differences for each document pair
-    - .DOC files will be converted to .DOCX automatically
     """)
     
     st.info("Processed files should have the naming pattern: `processed_<original_filename>.docx`")
@@ -637,8 +597,8 @@ def comparison_page():
     with col1:
         st.subheader("Original Documents")
         original_files = st.file_uploader(
-            "Upload original DOCX or DOC files", 
-            type=['docx', 'doc'],
+            "Upload original DOCX files", 
+            type=['docx'],
             key="original_uploader",
             accept_multiple_files=True
         )
@@ -649,8 +609,8 @@ def comparison_page():
     with col2:
         st.subheader("Processed Documents")
         processed_files = st.file_uploader(
-            "Upload processed DOCX or DOC files", 
-            type=['docx', 'doc'],
+            "Upload processed DOCX files", 
+            type=['docx'],
             key="processed_uploader",
             accept_multiple_files=True
         )
@@ -741,7 +701,6 @@ def comparison_page():
                                 with col_orig:
                                     st.subheader(f"Original Image {i+1}")
                                     if i < len(result['orig_images']):
-                                        # Use container_width
                                         st.image(result['orig_images'][i], use_container_width=True)
                                     else:
                                         st.warning("No image")
@@ -749,7 +708,6 @@ def comparison_page():
                                 with col_proc:
                                     st.subheader(f"Processed Image {i+1}")
                                     if i < len(result['proc_images']):
-                                        # Use container_width
                                         st.image(result['proc_images'][i], use_container_width=True)
                                     else:
                                         st.warning("No image")
@@ -772,7 +730,7 @@ def main():
     - Tesseract OCR installed
     - Python packages:
       ```bash
-      pip install opencv-python pytesseract numpy python-docx mammoth
+      pip install opencv-python pytesseract numpy
       ```
     """)
     
