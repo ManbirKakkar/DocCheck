@@ -15,12 +15,37 @@ import base64
 from PIL import Image
 from io import BytesIO
 import difflib
+import platform
+import sys
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
 
-# Configure Tesseract path if needed (uncomment and set path for Windows)
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Configure Tesseract path for Windows
+if platform.system() == "Windows":
+    # Check common installation paths
+    possible_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\{}\AppData\Local\Tesseract-OCR\tesseract.exe".format(os.getlogin()),
+        r"C:\tesseract\tesseract.exe"
+    ]
+    
+    tesseract_found = False
+    for path in possible_paths:
+        if os.path.exists(path):
+            pytesseract.pytesseract.tesseract_cmd = path
+            tesseract_found = True
+            break
+    
+    if not tesseract_found:
+        st.warning("Tesseract not found in common Windows paths. OCR functionality may not work.")
+else:
+    # Assume Tesseract is in PATH for Linux/Mac
+    try:
+        pytesseract.get_tesseract_version()
+    except pytesseract.TesseractNotFoundError:
+        st.warning("Tesseract not found in system PATH. OCR functionality may not work.")
 
 st.set_page_config(page_title="DOCX Number Processor", layout="wide")
 
@@ -31,6 +56,13 @@ def create_output_dir(path):
 
 def process_image(image_bytes):
     """Process image to replace number patterns using OCR"""
+    try:
+        # Try to get Tesseract version to verify installation
+        pytesseract.get_tesseract_version()
+    except pytesseract.TesseractNotFoundError:
+        st.error("Tesseract OCR is not installed or not in your PATH. Image processing disabled.")
+        return image_bytes
+        
     try:
         # Convert bytes to OpenCV image
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -268,6 +300,14 @@ def batch_processing_page():
            pip install opencv-python pytesseract numpy
            ```
         """)
+        
+        # Tesseract path configuration for Windows
+        if platform.system() == "Windows":
+            st.markdown("### Windows Tesseract Configuration")
+            st.info("Tesseract is installed in: " + (pytesseract.pytesseract.tesseract_cmd if hasattr(pytesseract.pytesseract, 'tesseract_cmd') else "Not configured"))
+            
+            if st.button("Refresh Tesseract Detection"):
+                st.experimental_rerun()
     
     # Create default output directory
     output_path = create_output_dir(DEFAULT_OUTPUT_PATH)
@@ -637,6 +677,15 @@ def main():
       ```
     """)
     
+    # Tesseract status
+    try:
+        version = pytesseract.get_tesseract_version()
+        st.sidebar.success(f"Tesseract v{version} detected")
+    except pytesseract.TesseractNotFoundError:
+        st.sidebar.error("Tesseract not found. Image processing disabled")
+    except Exception as e:
+        st.sidebar.warning(f"Tesseract detection failed: {str(e)}")
+    
     # Run the selected page
     if app_mode == "Batch Processing":
         batch_processing_page()
@@ -645,6 +694,12 @@ def main():
     
     # Show sample pattern
     st.sidebar.divider()
+    st.sidebar.markdown("### Pattern Examples")
+    st.sidebar.markdown("**Text Processing:**")
+    st.sidebar.code("72-123-4567890-99\n→ 72-123-4567890-99,4022-123-4567890-99")
+    
+    st.sidebar.markdown("**Image Processing:**")
+    st.sidebar.code("72-123-4567890-99\n→ 4022-123-4567890-99")
 
 if __name__ == "__main__":
     main()
