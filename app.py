@@ -17,6 +17,7 @@ from io import BytesIO
 import difflib
 import platform
 import sys
+import html  # Added for HTML escaping
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -267,14 +268,16 @@ def highlight_differences(text1, text2):
     result = []
     for word in diff:
         if word.startswith('  '):
-            # Unchanged
-            result.append(word[2:])
+            # Unchanged - escape HTML
+            result.append(html.escape(word[2:]))
         elif word.startswith('- '):
-            # Removed
-            result.append(f"<span style='background-color: #ffcccc; text-decoration: line-through;'>{word[2:]}</span>")
+            # Removed - escape HTML
+            escaped_word = html.escape(word[2:])
+            result.append(f"<span style='background-color: #ffcccc; text-decoration: line-through;'>{escaped_word}</span>")
         elif word.startswith('+ '):
-            # Added
-            result.append(f"<span style='background-color: #ccffcc;'>{word[2:]}</span>")
+            # Added - escape HTML
+            escaped_word = html.escape(word[2:])
+            result.append(f"<span style='background-color: #ccffcc;'>{escaped_word}</span>")
     
     return " ".join(result)
 
@@ -644,14 +647,16 @@ def comparison_page():
                                 with col_orig:
                                     st.subheader(f"Original Image {i+1}")
                                     if i < len(result['orig_images']):
-                                        st.image(result['orig_images'][i], use_column_width=True)
+                                        # Use container_width instead of column_width
+                                        st.image(result['orig_images'][i], use_container_width=True)
                                     else:
                                         st.warning("No image")
                                 
                                 with col_proc:
                                     st.subheader(f"Processed Image {i+1}")
                                     if i < len(result['proc_images']):
-                                        st.image(result['proc_images'][i], use_column_width=True)
+                                        # Use container_width instead of column_width
+                                        st.image(result['proc_images'][i], use_container_width=True)
                                     else:
                                         st.warning("No image")
                                 
