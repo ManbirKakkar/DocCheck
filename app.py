@@ -1,4 +1,3 @@
-
 import streamlit as st
 import os
 import re
@@ -12,10 +11,10 @@ import numpy as np
 import pytesseract
 import time
 from datetime import timedelta
-import base64
-from PIL import Image
-from io import BytesIO
-
+import platform
+import html
+from pdf2docx import Converter
+import fitz  # For PDF text extraction
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -46,12 +45,29 @@ else:
     except pytesseract.TesseractNotFoundError:
         st.warning("Tesseract not found in system PATH. OCR functionality may not work.")
 
-st.set_page_config(page_title="DOCX Number Processor", layout="wide")
+st.set_page_config(page_title="Document Number Processor", layout="wide")
+
+# Unified pattern for all formats - FIXED
+COMBINED_PATTERN = re.compile(
+    r'\b77\s*[-–—]?\s*([a-zA-Z0-9]{2,3})\s*[-–—]?\s*([a-zA-Z0-9]{5,7}[-a-zA-Z0-9]*)(?:\s*[-–—]?\s*([a-zA-Z0-9]{2,4}))?\b',
+    re.IGNORECASE
+)
 
 def create_output_dir(path):
     """Create output directory if it doesn't exist"""
     Path(path).mkdir(parents=True, exist_ok=True)
     return path
+
+def convert_pdf_to_docx(pdf_path, docx_path):
+    """Convert PDF to DOCX for processing"""
+    try:
+        cv = Converter(pdf_path)
+        cv.convert(docx_path, start=0, end=None)
+        cv.close()
+        return True
+    except Exception as e:
+        st.error(f"PDF conversion failed: {str(e)}")
+        return False
 
 def process_image(image_bytes):
     """Process image to replace number patterns using OCR"""
@@ -70,66 +86,104 @@ def process_image(image_bytes):
         if img is None:
             return image_bytes
             
-        # Convert to RGB and get dimensions
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        height, width, _ = img_rgb.shape
+        # Preprocessing for better OCR
+        # Resize image for better recognition
+        scale_factor = 1.5
+        img = cv2.resize(img, (0, 0), fx=scale_factor, fy=scale_factor)
         
-        # Use Tesseract to detect text and bounding boxes
-        data = pytesseract.image_to_data(
-            img_rgb, 
-            output_type=pytesseract.Output.DICT,
-            config='--psm 6'  # Assume uniform block of text
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply adaptive thresholding
+        gray = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11, 2
         )
         
-        # Define patterns
-        patterns = [
-            # 77-xxx-xxxxxx-xxx
-            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{3})\b'),
-            # 77-xxx-xxxxxx
-            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})\b'),
-            # 77-xxx-xxxxxx-xx
-            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{2})\b'),
-            # 77-xxx-xxxxxx-xxxx
-            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{4})\b')
-        ]
-        replacement = r'4022-\1-\2'
+        # Use Tesseract to detect text and bounding boxes - FIXED CONFIG
+        data = pytesseract.image_to_data(
+            gray, 
+            output_type=pytesseract.Output.DICT,
+            config='--psm 4 --oem 3 -l eng+chi_sim'  # Multi-language support
+        )
         
-        # Process each detected text element
+        # Track processed regions to avoid overlapping
+        processed_regions = []
+        
         n_boxes = len(data['text'])
         for i in range(n_boxes):
             if int(data['conf'][i]) > 60:  # Confidence threshold
                 text = data['text'][i]
-                for pattern in patterns:
-                    if pattern.search(text):
-                        # Get coordinates
-                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                match = COMBINED_PATTERN.search(text)
+                
+                if match:
+                    # Get coordinates
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                    
+                    # Skip if overlapping with previous processing
+                    overlap = False
+                    for (px, py, pw, ph) in processed_regions:
+                        if (x < px + pw and x + w > px and
+                            y < py + ph and y + h > py):
+                            overlap = True
+                            break
+                    
+                    if overlap:
+                        continue
+                    
+                    # Create background patch to cover original text
+                    padding = 5
+                    roi = img[y-padding:y+h+padding, x-padding:x+w+padding]
+                    if roi.size > 0:
+                        # Use average color for background
+                        avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
+                        cv2.rectangle(img, (x-padding, y-padding), (x+w+padding, y+h+padding), avg_color.tolist(), -1)
                         
-                        # Create background patch to cover original text
-                        roi = img[y-2:y+h+2, x-2:x+w+2]  # Slightly larger region
-                        if roi.size > 0:
-                            # Use average color for background
-                            avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
-                            cv2.rectangle(img, (x-2, y-2), (x+w+2, y+h+2), avg_color.tolist(), -1)
+                        # Prepare new text - HANDLE COMPLEX CASES
+                        g1, g2, g3 = match.group(1), match.group(2), match.group(3)
+                        
+                        # Handle cases like 77-531-014BLK-245
+                        if '-' in g2 and not g3:
+                            parts = g2.split('-')
+                            new_text = f"4022-{g1}-{parts[0]}"
+                            if len(parts) > 1:
+                                new_text += f"-{''.join(parts[1:])}"
+                        else:
+                            new_text = f"4022-{g1}-{g2}"
+                            if g3:
+                                new_text += f"-{g3}"
                             
-                            # Prepare new text
-                            new_text = pattern.sub(replacement, text)
-                            
-                            # Calculate font size based on bounding box height
-                            font_scale = h / 35
-                            thickness = max(1, int(font_scale))
-                            
-                            # Draw new text
-                            cv2.putText(
-                                img, 
-                                new_text, 
-                                (x, y+h),  # Position at bottom of original text area
-                                cv2.FONT_HERSHEY_SIMPLEX, 
-                                font_scale, 
-                                (0, 0, 0),  # Black text
-                                thickness,
-                                cv2.LINE_AA
-                            )
-                        break  # Stop checking other patterns if one matches
+                        # Calculate font size based on bounding box height
+                        font_scale = h / 35
+                        thickness = max(1, int(font_scale))
+                        
+                        # Calculate text size to center it
+                        text_size = cv2.getTextSize(
+                            new_text, 
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            font_scale, 
+                            thickness
+                        )[0]
+                        
+                        text_x = x + (w - text_size[0]) // 2
+                        text_y = y + h // 2 + text_size[1] // 2
+                        
+                        # Draw new text
+                        cv2.putText(
+                            img, 
+                            new_text, 
+                            (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            font_scale, 
+                            (0, 0, 0),  # Black text
+                            thickness,
+                            cv2.LINE_AA
+                        )
+                        
+                        # Track processed region
+                        processed_regions.append((x-padding, y-padding, w+padding*2, h+padding*2))
         
         # Convert back to bytes
         _, img_bytes = cv2.imencode('.jpg', img)
@@ -141,18 +195,6 @@ def process_image(image_bytes):
 
 def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
     """Process DOCX file to handle number patterns in text and images"""
-    # Define patterns
-    patterns = [
-        # 77-xxx-xxxxxx-xxx
-        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{3})\b'),
-        # 77-xxx-xxxxxx
-        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})\b'),
-        # 77-xxx-xxxxxx-xx
-        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{2})\b'),
-        # 77-xxx-xxxxxx-xxxx
-        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{4})\b')
-    ]
-    
     # Create temporary working directory
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -185,11 +227,35 @@ def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
             # Find all text elements
             for t in root.findall('.//w:t', namespaces):
                 if t.text:
-                    new_text = t.text
-                    for pattern in patterns:
-                        # For text: append new number after comma
-                        new_text = pattern.sub(r'\g<0>,4022-\1-\2', new_text)
-                    t.text = new_text
+                    # Replace patterns only once - FIXED LOGIC
+                    def replace_func(match):
+                        a, b, c = match.group(1), match.group(2), match.group(3)
+                        base = f"77-{a}-{b}"
+                        new = f"4022-{a}-{b.split('-')[0]}"  # Take only the first part before hyphen
+                        
+                        # Handle cases like 77-531-014BLK-245
+                        if '-' in b and not c:
+                            parts = b.split('-')
+                            base = f"77-{a}-{'-'.join(parts)}"
+                            new = f"4022-{a}-{parts[0]}"
+                            if len(parts) > 1:
+                                new += f"-{''.join(parts[1:])}"
+                        
+                        if c:
+                            base += f"-{c}"
+                            new += f"-{c}"
+                        return f"{base},{new}"
+                    
+                    t.text = COMBINED_PATTERN.sub(replace_func, t.text)
+            
+            # Enable auto-size for textboxes to prevent clipping
+            for textbox in root.findall('.//w:txbxContent', namespaces):
+                bodyPr = textbox.find('.//w:bodyPr', namespaces)
+                if bodyPr is not None:
+                    # Enable auto-sizing
+                    bodyPr.set('vertOverflow', "overflow")
+                    bodyPr.set('horzOverflow', "overflow")
+                    bodyPr.set('wrap', "none")
             
             # Save changes
             tree.write(file_path, encoding='utf-8', xml_declaration=True)
@@ -229,6 +295,7 @@ def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
                     arcname = os.path.relpath(file_path, tmpdir)
                     zip_out.write(file_path, arcname)
 
+
 def extract_text_from_docx(docx_path):
     """Extract text content from DOCX file"""
     text = ""
@@ -263,6 +330,18 @@ def extract_text_from_docx(docx_path):
                     
     return text
 
+def extract_text_from_pdf(pdf_path):
+    """Extract text content from PDF file"""
+    text = ""
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            text += page.get_text()
+        return text
+    except Exception as e:
+        st.error(f"PDF text extraction failed: {str(e)}")
+        return ""
+
 def extract_images_from_docx(docx_path):
     """Extract images from DOCX file"""
     images = []
@@ -287,7 +366,7 @@ def extract_images_from_docx(docx_path):
 
 def highlight_differences(text1, text2):
     """Create a visual diff of two text documents"""
-    import difflib  # Import moved inside the function
+    import difflib
     d = difflib.Differ()
     diff = list(d.compare(text1.split(), text2.split()))
     
@@ -310,7 +389,7 @@ def highlight_differences(text1, text2):
 def batch_processing_page():
     st.title("📄 Batch Processing")
     st.markdown("""
-    ### Process multiple DOCX files with pattern replacement:
+    ### Process multiple DOCX/PDF files with pattern replacement:
     - Upload multiple files at once
     - Process all files in a single operation
     - Each file processed independently
@@ -327,14 +406,15 @@ def batch_processing_page():
            - **Linux**: `sudo apt install tesseract-ocr`
         2. Install Python dependencies:
            ```bash
-           pip install opencv-python pytesseract numpy
+           pip install opencv-python pytesseract numpy pdf2docx pymupdf
            ```
         """)
         
         # Tesseract path configuration for Windows
         if platform.system() == "Windows":
             st.markdown("### Windows Tesseract Configuration")
-            st.info("Tesseract is installed in: " + (pytesseract.pytesseract.tesseract_cmd if hasattr(pytesseract.pytesseract, 'tesseract_cmd') else "Not configured"))
+            tesseract_path = pytesseract.pytesseract.tesseract_cmd if hasattr(pytesseract.pytesseract, 'tesseract_cmd') else "Not configured"
+            st.info(f"Tesseract is installed in: {tesseract_path}")
             
             if st.button("Refresh Tesseract Detection"):
                 st.experimental_rerun()
@@ -345,8 +425,8 @@ def batch_processing_page():
     # File upload section
     with st.expander("📤 Upload Documents", expanded=True):
         uploaded_files = st.file_uploader(
-            "Select DOCX files", 
-            type=['docx'],
+            "Select DOCX or PDF files", 
+            type=['docx', 'pdf'],
             help="Documents containing patterns like 77-xxx-xxxxxx",
             accept_multiple_files=True
         )
@@ -384,6 +464,7 @@ def batch_processing_page():
             
             for file_idx, uploaded_file in enumerate(uploaded_files):
                 file_start_time = time.time()
+                docx_temp = None  # Initialize docx_temp here
                 
                 # Update global status
                 global_status.info(f"📁 Processing file {file_idx+1}/{total_files}: {uploaded_file.name}")
@@ -391,13 +472,32 @@ def batch_processing_page():
                 
                 # Prepare output filename
                 original_name = uploaded_file.name
-                processed_name = f"processed_{Path(original_name).stem}.docx"
-                output_filepath = os.path.join(output_dir, processed_name)
+                base_name = Path(original_name).stem
+                output_filepath = os.path.join(output_dir, f"processed_{base_name}.docx")
                 
                 # Save uploaded file to temp location
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{Path(original_name).suffix}") as tmp_file:
                     tmp_file.write(uploaded_file.getbuffer())
                     tmp_path = tmp_file.name
+                
+                # Handle PDF files
+                if uploaded_file.name.lower().endswith('.pdf'):
+                    # Convert PDF to DOCX
+                    docx_temp = tmp_path.replace('.pdf', '.docx')
+                    if convert_pdf_to_docx(tmp_path, docx_temp):
+                        processing_path = docx_temp
+                    else:
+                        # Skip processing if conversion failed
+                        results.append({
+                            'file': original_name,
+                            'status': '❌ PDF conversion failed',
+                            'time': '0:00:00',
+                            'path': '',
+                            'processed_name': ''
+                        })
+                        continue
+                else:
+                    processing_path = tmp_path
                 
                 # Create progress callback for individual file
                 file_progress_bar = results_container.progress(0)
@@ -412,7 +512,7 @@ def batch_processing_page():
                 # Process document
                 try:
                     file_status.info(f"🔄 Starting processing: {uploaded_file.name}")
-                    replace_pattern_in_docx(tmp_path, output_filepath, progress_callback=update_file_progress)
+                    replace_pattern_in_docx(processing_path, output_filepath, progress_callback=update_file_progress)
                     
                     # Record success
                     file_elapsed = time.time() - file_start_time
@@ -425,7 +525,7 @@ def batch_processing_page():
                         'status': '✅ Success',
                         'time': str(timedelta(seconds=int(file_elapsed))),
                         'path': output_filepath,
-                        'processed_name': processed_name
+                        'processed_name': f"processed_{base_name}.docx"
                     })
                     
                 except Exception as e:
@@ -442,9 +542,11 @@ def batch_processing_page():
                     })
                 
                 finally:
-                    # Clean up temp file
+                    # Clean up temp files
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
+                    if docx_temp and os.path.exists(docx_temp):
+                        os.unlink(docx_temp)
                 
                 # Update global progress
                 global_progress_bar.progress((file_idx+1) / total_files)
@@ -461,7 +563,7 @@ def batch_processing_page():
                 if results:
                     # Create download buttons for successful files
                     for result in results:
-                        if result['status'] == '✅ Success':
+                        if result['status'] == '✅ Success' and os.path.exists(result['path']):
                             with open(result['path'], 'rb') as f:
                                 st.download_button(
                                     label=f"⬇️ Download {result['processed_name']}",
@@ -478,6 +580,7 @@ def batch_processing_page():
                         "Status": r['status'],
                         "Processing Time": r['time'],
                     } for r in results])
+
 
 def match_files(original_files, processed_files):
     """Match original files with processed files based on filename pattern"""
@@ -522,12 +625,19 @@ def compare_document_pair(original_file, processed_file):
         
         try:
             # Extract text from both documents
-            orig_text = extract_text_from_docx(orig_path)
-            proc_text = extract_text_from_docx(proc_path)
+            if original_file.name.lower().endswith('.pdf'):
+                orig_text = extract_text_from_pdf(orig_path)
+            else:
+                orig_text = extract_text_from_docx(orig_path)
+                
+            if processed_file.name.lower().endswith('.pdf'):
+                proc_text = extract_text_from_pdf(proc_path)
+            else:
+                proc_text = extract_text_from_docx(proc_path)
             
             # Extract images from both documents
-            orig_images = extract_images_from_docx(orig_path)
-            proc_images = extract_images_from_docx(proc_path)
+            orig_images = extract_images_from_docx(orig_path) if not original_file.name.lower().endswith('.pdf') else []
+            proc_images = extract_images_from_docx(proc_path) if not processed_file.name.lower().endswith('.pdf') else []
             
             # Create visual diff
             html_diff = highlight_differences(orig_text, proc_text)
@@ -561,7 +671,7 @@ def compare_document_pair(original_file, processed_file):
 def comparison_page():
     st.title("🔍 Batch Document Comparison")
     st.markdown("""
-    ### Compare multiple original and processed DOCX files:
+    ### Compare multiple original and processed DOCX/PDF files:
     - Upload sets of original and processed files
     - Files are automatically matched by filename
     - See differences for each document pair
@@ -574,8 +684,8 @@ def comparison_page():
     with col1:
         st.subheader("Original Documents")
         original_files = st.file_uploader(
-            "Upload original DOCX files", 
-            type=['docx'],
+            "Upload original DOCX/PDF files", 
+            type=['docx', 'pdf'],
             key="original_uploader",
             accept_multiple_files=True
         )
@@ -707,7 +817,7 @@ def main():
     - Tesseract OCR installed
     - Python packages:
       ```bash
-      pip install opencv-python pytesseract numpy
+      pip install opencv-python pytesseract numpy pdf2docx pymupdf
       ```
     """)
     
