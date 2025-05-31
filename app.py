@@ -1,3 +1,4 @@
+
 import streamlit as st
 import os
 import re
@@ -11,8 +12,10 @@ import numpy as np
 import pytesseract
 import time
 from datetime import timedelta
-import html
-import platform
+import base64
+from PIL import Image
+from io import BytesIO
+
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -284,6 +287,7 @@ def extract_images_from_docx(docx_path):
 
 def highlight_differences(text1, text2):
     """Create a visual diff of two text documents"""
+    import difflib  # Import moved inside the function
     d = difflib.Differ()
     diff = list(d.compare(text1.split(), text2.split()))
     
