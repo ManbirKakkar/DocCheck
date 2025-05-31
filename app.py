@@ -11,14 +11,8 @@ import numpy as np
 import pytesseract
 import time
 from datetime import timedelta
-import base64
-from PIL import Image
-from io import BytesIO
-import difflib
-import platform
-import sys
 import html
-import subprocess  # For DOC to DOCX conversion
+import platform
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -49,47 +43,12 @@ else:
     except pytesseract.TesseractNotFoundError:
         st.warning("Tesseract not found in system PATH. OCR functionality may not work.")
 
-st.set_page_config(page_title="DOCX/DOC Number Processor", layout="wide")
+st.set_page_config(page_title="DOCX Number Processor", layout="wide")
 
 def create_output_dir(path):
     """Create output directory if it doesn't exist"""
     Path(path).mkdir(parents=True, exist_ok=True)
     return path
-
-def convert_doc_to_docx(doc_path):
-    """Convert DOC file to DOCX format using LibreOffice"""
-    try:
-        # Create temp output directory
-        output_dir = tempfile.mkdtemp()
-        output_path = os.path.join(output_dir, "converted.docx")
-        
-        # Run LibreOffice conversion
-        cmd = [
-            "libreoffice",
-            "--headless",
-            "--convert-to",
-            "docx",
-            "--outdir",
-            output_dir,
-            doc_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            st.error(f"DOC to DOCX conversion failed: {result.stderr}")
-            return None
-        
-        # Read converted file
-        with open(output_path, "rb") as f:
-            docx_bytes = f.read()
-        
-        # Clean up
-        shutil.rmtree(output_dir)
-        return docx_bytes
-    except Exception as e:
-        st.error(f"DOC to DOCX conversion failed: {str(e)}")
-        return None
 
 def process_image(image_bytes):
     """Process image to replace number patterns using OCR"""
@@ -119,46 +78,55 @@ def process_image(image_bytes):
             config='--psm 6'  # Assume uniform block of text
         )
         
-        # Define pattern and replacement
-        # Updated pattern: 77-xxx-xxxxxxx-xx or 77-xxx-xxxxxxx-xxx or 77-xxx-xxxxxxx-xxxx
-        # Where x can be number or alphabet
-        pattern = re.compile(r'\b(\d{2})-([a-zA-Z0-9]{3,4})-([a-zA-Z0-9]{7})-([a-zA-Z0-9]{2,4})\b')
-        replacement = r'4022-\2-\3-\4'
+        # Define patterns
+        patterns = [
+            # 77-xxx-xxxxxx-xxx
+            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{3})\b'),
+            # 77-xxx-xxxxxx
+            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})\b'),
+            # 77-xxx-xxxxxx-xx
+            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{2})\b'),
+            # 77-xxx-xxxxxx-xxxx
+            re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{4})\b')
+        ]
+        replacement = r'4022-\1-\2'
         
         # Process each detected text element
         n_boxes = len(data['text'])
         for i in range(n_boxes):
             if int(data['conf'][i]) > 60:  # Confidence threshold
                 text = data['text'][i]
-                if pattern.search(text):
-                    # Get coordinates
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                    
-                    # Create background patch to cover original text
-                    roi = img[y-2:y+h+2, x-2:x+w+2]  # Slightly larger region
-                    if roi.size > 0:
-                        # Use average color for background
-                        avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
-                        cv2.rectangle(img, (x-2, y-2), (x+w+2, y+h+2), avg_color.tolist(), -1)
+                for pattern in patterns:
+                    if pattern.search(text):
+                        # Get coordinates
+                        x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                         
-                        # Prepare new text
-                        new_text = pattern.sub(replacement, text)
-                        
-                        # Calculate font size based on bounding box height
-                        font_scale = h / 35
-                        thickness = max(1, int(font_scale))
-                        
-                        # Draw new text
-                        cv2.putText(
-                            img, 
-                            new_text, 
-                            (x, y+h),  # Position at bottom of original text area
-                            cv2.FONT_HERSHEY_SIMPLEX, 
-                            font_scale, 
-                            (0, 0, 0),  # Black text
-                            thickness,
-                            cv2.LINE_AA
-                        )
+                        # Create background patch to cover original text
+                        roi = img[y-2:y+h+2, x-2:x+w+2]  # Slightly larger region
+                        if roi.size > 0:
+                            # Use average color for background
+                            avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
+                            cv2.rectangle(img, (x-2, y-2), (x+w+2, y+h+2), avg_color.tolist(), -1)
+                            
+                            # Prepare new text
+                            new_text = pattern.sub(replacement, text)
+                            
+                            # Calculate font size based on bounding box height
+                            font_scale = h / 35
+                            thickness = max(1, int(font_scale))
+                            
+                            # Draw new text
+                            cv2.putText(
+                                img, 
+                                new_text, 
+                                (x, y+h),  # Position at bottom of original text area
+                                cv2.FONT_HERSHEY_SIMPLEX, 
+                                font_scale, 
+                                (0, 0, 0),  # Black text
+                                thickness,
+                                cv2.LINE_AA
+                            )
+                        break  # Stop checking other patterns if one matches
         
         # Convert back to bytes
         _, img_bytes = cv2.imencode('.jpg', img)
@@ -170,8 +138,17 @@ def process_image(image_bytes):
 
 def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
     """Process DOCX file to handle number patterns in text and images"""
-    # Updated pattern to match 77-xxx-xxxxxxx-xx with variable last segment and alphanumeric
-    pattern = re.compile(r'\b(\d{2})-([a-zA-Z0-9]{3,4})-([a-zA-Z0-9]{7})-([a-zA-Z0-9]{2,4})\b')
+    # Define patterns
+    patterns = [
+        # 77-xxx-xxxxxx-xxx
+        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{3})\b'),
+        # 77-xxx-xxxxxx
+        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})\b'),
+        # 77-xxx-xxxxxx-xx
+        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{2})\b'),
+        # 77-xxx-xxxxxx-xxxx
+        re.compile(r'\b77-([a-zA-Z0-9]{3})-([a-zA-Z0-9]{6})-([a-zA-Z0-9]{4})\b')
+    ]
     
     # Create temporary working directory
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -204,9 +181,12 @@ def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
             
             # Find all text elements
             for t in root.findall('.//w:t', namespaces):
-                if t.text and pattern.search(t.text):
-                    # For text: append new number after comma
-                    t.text = pattern.sub(r'\g<0>,4022-\2-\3-\4', t.text)
+                if t.text:
+                    new_text = t.text
+                    for pattern in patterns:
+                        # For text: append new number after comma
+                        new_text = pattern.sub(r'\g<0>,4022-\1-\2', new_text)
+                    t.text = new_text
             
             # Save changes
             tree.write(file_path, encoding='utf-8', xml_declaration=True)
@@ -330,7 +310,7 @@ def batch_processing_page():
     - Upload multiple files at once
     - Process all files in a single operation
     - Each file processed independently
-    - .DOC files are not currently supported
+    - Supports various pattern formats
     """)
     
     # Dependencies note
@@ -363,7 +343,7 @@ def batch_processing_page():
         uploaded_files = st.file_uploader(
             "Select DOCX files", 
             type=['docx'],
-            help="Documents containing number patterns (e.g., 77-xxx-xxxxxxx-xx)",
+            help="Documents containing patterns like 77-xxx-xxxxxx",
             accept_multiple_files=True
         )
         
@@ -527,23 +507,16 @@ def match_files(original_files, processed_files):
 def compare_document_pair(original_file, processed_file):
     """Compare a single document pair and return results"""
     with st.spinner(f"Comparing {original_file.name} and {processed_file.name}..."):
-        # Prepare original file
-        orig_bytes = original_file.getbuffer()
+        # Save files to temp locations
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as orig_tmp:
+            orig_tmp.write(original_file.getbuffer())
+            orig_path = orig_tmp.name
         
-        # Prepare processed file
-        proc_bytes = processed_file.getbuffer()
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as proc_tmp:
+            proc_tmp.write(processed_file.getbuffer())
+            proc_path = proc_tmp.name
         
         try:
-            # Save original file to temp location
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as orig_tmp:
-                orig_tmp.write(orig_bytes)
-                orig_path = orig_tmp.name
-            
-            # Save processed file to temp location
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as proc_tmp:
-                proc_tmp.write(proc_bytes)
-                proc_path = proc_tmp.name
-            
             # Extract text from both documents
             orig_text = extract_text_from_docx(orig_path)
             proc_text = extract_text_from_docx(proc_path)
@@ -743,20 +716,21 @@ def main():
     except Exception as e:
         st.sidebar.warning(f"Tesseract detection failed: {str(e)}")
     
+    # Pattern examples
+    st.sidebar.divider()
+    st.sidebar.markdown("### Pattern Examples")
+    st.sidebar.markdown("**Supported Formats:**")
+    st.sidebar.code("77-ABC-123456\n77-ABC-123456-XX\n77-ABC-123456-XXX\n77-ABC-123456-XXXX")
+    st.sidebar.markdown("**Text Processing:**")
+    st.sidebar.code("77-ABC-123456 → 77-ABC-123456,4022-ABC-123456")
+    st.sidebar.markdown("**Image Processing:**")
+    st.sidebar.code("77-ABC-123456 → 4022-ABC-123456")
+    
     # Run the selected page
     if app_mode == "Batch Processing":
         batch_processing_page()
     elif app_mode == "Document Comparison":
         comparison_page()
-    
-    # Show sample pattern
-    st.sidebar.divider()
-    st.sidebar.markdown("### Pattern Examples")
-    st.sidebar.markdown("**Text Processing:**")
-    st.sidebar.code("77-AB3-12X45Y7-99\n→ 77-AB3-12X45Y7-99,4022-AB3-12X45Y7-99")
-    
-    st.sidebar.markdown("**Image Processing:**")
-    st.sidebar.code("77-AB3-12X45Y7-99\n→ 4022-AB3-12X45Y7-99")
 
 if __name__ == "__main__":
     main()
