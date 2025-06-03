@@ -445,7 +445,7 @@ def batch_processing_page():
                 def update_file_progress(percent, file_idx=file_idx):
                     file_progress_bar.progress(min(100, int(percent)))
                     elapsed = time.time() - file_start_time
-                    file_time.info(f"⏱️ File time: {timedelta(seconds=int(elapsed))")
+                    file_status.info(f"⏱️ File time: {timedelta(seconds=int(elapsed))}")
                 
                 # Process document
                 try:
