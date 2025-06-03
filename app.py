@@ -13,8 +13,6 @@ import time
 from datetime import timedelta
 import platform
 import html
-from pdf2docx import Converter
-import fitz  # For PDF text extraction
 
 # Set default output path
 DEFAULT_OUTPUT_PATH = "output_docs"
@@ -47,9 +45,9 @@ else:
 
 st.set_page_config(page_title="Document Number Processor", layout="wide")
 
-# Unified pattern for all formats - FIXED
+# Unified pattern for all formats - UPDATED
 COMBINED_PATTERN = re.compile(
-    r'\b77\s*[-–—]?\s*([a-zA-Z0-9]{2,3})\s*[-–—]?\s*([a-zA-Z0-9]{5,7}[-a-zA-Z0-9]*)(?:\s*[-–—]?\s*([a-zA-Z0-9]{2,4}))?\b',
+    r'\b77\s*[-–—]?\s*([a-zA-Z0-9]{2,3})\s*[-–—]?\s*([a-zA-Z0-9]{5,7})\s*(?:[-–—]?\s*([a-zA-Z0-9]{2,4}))?\b',
     re.IGNORECASE
 )
 
@@ -57,17 +55,6 @@ def create_output_dir(path):
     """Create output directory if it doesn't exist"""
     Path(path).mkdir(parents=True, exist_ok=True)
     return path
-
-def convert_pdf_to_docx(pdf_path, docx_path):
-    """Convert PDF to DOCX for processing"""
-    try:
-        cv = Converter(pdf_path)
-        cv.convert(docx_path, start=0, end=None)
-        cv.close()
-        return True
-    except Exception as e:
-        st.error(f"PDF conversion failed: {str(e)}")
-        return False
 
 def process_image(image_bytes):
     """Process image to replace number patterns using OCR"""
@@ -141,19 +128,11 @@ def process_image(image_bytes):
                         avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
                         cv2.rectangle(img, (x-padding, y-padding), (x+w+padding, y+h+padding), avg_color.tolist(), -1)
                         
-                        # Prepare new text - HANDLE COMPLEX CASES
+                        # Prepare new text - SIMPLIFIED LOGIC
                         g1, g2, g3 = match.group(1), match.group(2), match.group(3)
-                        
-                        # Handle cases like 77-531-014BLK-245
-                        if '-' in g2 and not g3:
-                            parts = g2.split('-')
-                            new_text = f"4022-{g1}-{parts[0]}"
-                            if len(parts) > 1:
-                                new_text += f"-{''.join(parts[1:])}"
-                        else:
-                            new_text = f"4022-{g1}-{g2}"
-                            if g3:
-                                new_text += f"-{g3}"
+                        new_text = f"4022-{g1}-{g2}"
+                        if g3:
+                            new_text += f"-{g3}"
                             
                         # Calculate font size based on bounding box height
                         font_scale = h / 35
@@ -227,20 +206,11 @@ def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
             # Find all text elements
             for t in root.findall('.//w:t', namespaces):
                 if t.text:
-                    # Replace patterns only once - FIXED LOGIC
+                    # Replace patterns only once - SIMPLIFIED LOGIC
                     def replace_func(match):
                         a, b, c = match.group(1), match.group(2), match.group(3)
                         base = f"77-{a}-{b}"
-                        new = f"4022-{a}-{b.split('-')[0]}"  # Take only the first part before hyphen
-                        
-                        # Handle cases like 77-531-014BLK-245
-                        if '-' in b and not c:
-                            parts = b.split('-')
-                            base = f"77-{a}-{'-'.join(parts)}"
-                            new = f"4022-{a}-{parts[0]}"
-                            if len(parts) > 1:
-                                new += f"-{''.join(parts[1:])}"
-                        
+                        new = f"4022-{a}-{b}"
                         if c:
                             base += f"-{c}"
                             new += f"-{c}"
@@ -330,18 +300,6 @@ def extract_text_from_docx(docx_path):
                     
     return text
 
-def extract_text_from_pdf(pdf_path):
-    """Extract text content from PDF file"""
-    text = ""
-    try:
-        doc = fitz.open(pdf_path)
-        for page in doc:
-            text += page.get_text()
-        return text
-    except Exception as e:
-        st.error(f"PDF text extraction failed: {str(e)}")
-        return ""
-
 def extract_images_from_docx(docx_path):
     """Extract images from DOCX file"""
     images = []
@@ -389,7 +347,7 @@ def highlight_differences(text1, text2):
 def batch_processing_page():
     st.title("📄 Batch Processing")
     st.markdown("""
-    ### Process multiple DOCX/PDF files with pattern replacement:
+    ### Process multiple DOCX files with pattern replacement:
     - Upload multiple files at once
     - Process all files in a single operation
     - Each file processed independently
@@ -406,7 +364,7 @@ def batch_processing_page():
            - **Linux**: `sudo apt install tesseract-ocr`
         2. Install Python dependencies:
            ```bash
-           pip install opencv-python pytesseract numpy pdf2docx pymupdf
+           pip install opencv-python pytesseract numpy
            ```
         """)
         
@@ -425,8 +383,8 @@ def batch_processing_page():
     # File upload section
     with st.expander("📤 Upload Documents", expanded=True):
         uploaded_files = st.file_uploader(
-            "Select DOCX or PDF files", 
-            type=['docx', 'pdf'],
+            "Select DOCX files", 
+            type=['docx'],
             help="Documents containing patterns like 77-xxx-xxxxxx",
             accept_multiple_files=True
         )
@@ -464,7 +422,6 @@ def batch_processing_page():
             
             for file_idx, uploaded_file in enumerate(uploaded_files):
                 file_start_time = time.time()
-                docx_temp = None  # Initialize docx_temp here
                 
                 # Update global status
                 global_status.info(f"📁 Processing file {file_idx+1}/{total_files}: {uploaded_file.name}")
@@ -476,28 +433,9 @@ def batch_processing_page():
                 output_filepath = os.path.join(output_dir, f"processed_{base_name}.docx")
                 
                 # Save uploaded file to temp location
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{Path(original_name).suffix}") as tmp_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
                     tmp_file.write(uploaded_file.getbuffer())
                     tmp_path = tmp_file.name
-                
-                # Handle PDF files
-                if uploaded_file.name.lower().endswith('.pdf'):
-                    # Convert PDF to DOCX
-                    docx_temp = tmp_path.replace('.pdf', '.docx')
-                    if convert_pdf_to_docx(tmp_path, docx_temp):
-                        processing_path = docx_temp
-                    else:
-                        # Skip processing if conversion failed
-                        results.append({
-                            'file': original_name,
-                            'status': '❌ PDF conversion failed',
-                            'time': '0:00:00',
-                            'path': '',
-                            'processed_name': ''
-                        })
-                        continue
-                else:
-                    processing_path = tmp_path
                 
                 # Create progress callback for individual file
                 file_progress_bar = results_container.progress(0)
@@ -507,12 +445,12 @@ def batch_processing_page():
                 def update_file_progress(percent, file_idx=file_idx):
                     file_progress_bar.progress(min(100, int(percent)))
                     elapsed = time.time() - file_start_time
-                    file_time.info(f"⏱️ File time: {timedelta(seconds=int(elapsed))}")
+                    file_time.info(f"⏱️ File time: {timedelta(seconds=int(elapsed))")
                 
                 # Process document
                 try:
                     file_status.info(f"🔄 Starting processing: {uploaded_file.name}")
-                    replace_pattern_in_docx(processing_path, output_filepath, progress_callback=update_file_progress)
+                    replace_pattern_in_docx(tmp_path, output_filepath, progress_callback=update_file_progress)
                     
                     # Record success
                     file_elapsed = time.time() - file_start_time
@@ -545,8 +483,6 @@ def batch_processing_page():
                     # Clean up temp files
                     if os.path.exists(tmp_path):
                         os.unlink(tmp_path)
-                    if docx_temp and os.path.exists(docx_temp):
-                        os.unlink(docx_temp)
                 
                 # Update global progress
                 global_progress_bar.progress((file_idx+1) / total_files)
@@ -625,19 +561,12 @@ def compare_document_pair(original_file, processed_file):
         
         try:
             # Extract text from both documents
-            if original_file.name.lower().endswith('.pdf'):
-                orig_text = extract_text_from_pdf(orig_path)
-            else:
-                orig_text = extract_text_from_docx(orig_path)
-                
-            if processed_file.name.lower().endswith('.pdf'):
-                proc_text = extract_text_from_pdf(proc_path)
-            else:
-                proc_text = extract_text_from_docx(proc_path)
+            orig_text = extract_text_from_docx(orig_path)
+            proc_text = extract_text_from_docx(proc_path)
             
             # Extract images from both documents
-            orig_images = extract_images_from_docx(orig_path) if not original_file.name.lower().endswith('.pdf') else []
-            proc_images = extract_images_from_docx(proc_path) if not processed_file.name.lower().endswith('.pdf') else []
+            orig_images = extract_images_from_docx(orig_path)
+            proc_images = extract_images_from_docx(proc_path)
             
             # Create visual diff
             html_diff = highlight_differences(orig_text, proc_text)
@@ -671,7 +600,7 @@ def compare_document_pair(original_file, processed_file):
 def comparison_page():
     st.title("🔍 Batch Document Comparison")
     st.markdown("""
-    ### Compare multiple original and processed DOCX/PDF files:
+    ### Compare multiple original and processed DOCX files:
     - Upload sets of original and processed files
     - Files are automatically matched by filename
     - See differences for each document pair
@@ -684,8 +613,8 @@ def comparison_page():
     with col1:
         st.subheader("Original Documents")
         original_files = st.file_uploader(
-            "Upload original DOCX/PDF files", 
-            type=['docx', 'pdf'],
+            "Upload original DOCX files", 
+            type=['docx'],
             key="original_uploader",
             accept_multiple_files=True
         )
@@ -817,7 +746,7 @@ def main():
     - Tesseract OCR installed
     - Python packages:
       ```bash
-      pip install opencv-python pytesseract numpy pdf2docx pymupdf
+      pip install opencv-python pytesseract numpy
       ```
     """)
     
