@@ -45,9 +45,9 @@ else:
 
 st.set_page_config(page_title="Document Number Processor", layout="wide")
 
-# Unified pattern for all formats - UPDATED
+# Unified pattern for all formats - CORRECTED
 COMBINED_PATTERN = re.compile(
-    r'\b77\s*[-–—]?\s*([a-zA-Z0-9]{2,3})\s*[-–—]?\s*([a-zA-Z0-9]{5,7})\s*(?:[-–—]?\s*([a-zA-Z0-9]{2,4}))?\b',
+    r'\b77\s*[-–—]?\s*([a-zA-Z0-9]{2,3})\s*[-–—]?\s*([a-zA-Z0-9]{5,8})\s*(?:[-–—]?\s*([a-zA-Z0-9]{2,4}))?\b',
     re.IGNORECASE
 )
 
@@ -123,46 +123,47 @@ def process_image(image_bytes):
                     # Create background patch to cover original text
                     padding = 5
                     roi = img[y-padding:y+h+padding, x-padding:x+w+padding]
-                    if roi.size > 0:
-                        # Use average color for background
-                        avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
-                        cv2.rectangle(img, (x-padding, y-padding), (x+w+padding, y+h+padding), avg_color.tolist(), -1)
+                    if roi.size == 0:  # Skip empty regions
+                        continue
+                    # Use average color for background
+                    avg_color = np.mean(roi, axis=(0, 1)).astype(np.uint8)
+                    cv2.rectangle(img, (x-padding, y-padding), (x+w+padding, y+h+padding), avg_color.tolist(), -1)
+                    
+                    # Prepare new text - SIMPLIFIED LOGIC
+                    g1, g2, g3 = match.group(1), match.group(2), match.group(3)
+                    new_text = f"4022-{g1}-{g2}"
+                    if g3:
+                        new_text += f"-{g3}"
                         
-                        # Prepare new text - SIMPLIFIED LOGIC
-                        g1, g2, g3 = match.group(1), match.group(2), match.group(3)
-                        new_text = f"4022-{g1}-{g2}"
-                        if g3:
-                            new_text += f"-{g3}"
-                            
-                        # Calculate font size based on bounding box height
-                        font_scale = h / 35
-                        thickness = max(1, int(font_scale))
-                        
-                        # Calculate text size to center it
-                        text_size = cv2.getTextSize(
-                            new_text, 
-                            cv2.FONT_HERSHEY_SIMPLEX, 
-                            font_scale, 
-                            thickness
-                        )[0]
-                        
-                        text_x = x + (w - text_size[0]) // 2
-                        text_y = y + h // 2 + text_size[1] // 2
-                        
-                        # Draw new text
-                        cv2.putText(
-                            img, 
-                            new_text, 
-                            (text_x, text_y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 
-                            font_scale, 
-                            (0, 0, 0),  # Black text
-                            thickness,
-                            cv2.LINE_AA
-                        )
-                        
-                        # Track processed region
-                        processed_regions.append((x-padding, y-padding, w+padding*2, h+padding*2))
+                    # Calculate font size based on bounding box height
+                    font_scale = h / 35
+                    thickness = max(1, int(font_scale))
+                    
+                    # Calculate text size to center it
+                    text_size = cv2.getTextSize(
+                        new_text, 
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        font_scale, 
+                        thickness
+                    )[0]
+                    
+                    text_x = x + (w - text_size[0]) // 2
+                    text_y = y + h // 2 + text_size[1] // 2
+                    
+                    # Draw new text
+                    cv2.putText(
+                        img, 
+                        new_text, 
+                        (text_x, text_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 
+                        font_scale, 
+                        (0, 0, 0),  # Black text
+                        thickness,
+                        cv2.LINE_AA
+                    )
+                    
+                    # Track processed region
+                    processed_regions.append((x-padding, y-padding, w+padding*2, h+padding*2))
         
         # Convert back to bytes
         _, img_bytes = cv2.imencode('.jpg', img)
@@ -254,7 +255,7 @@ def replace_pattern_in_docx(docx_path, output_path, progress_callback=None):
                         f.write(processed_img)
                 
                 # Update progress
-                if progress_callback:
+                if progress_callback and total_images > 0:
                     progress_callback(50 + 50 * (idx + 1) / total_images)
         
         # Create new DOCX with modified content
