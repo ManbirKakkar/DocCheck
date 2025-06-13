@@ -175,7 +175,8 @@ def replace_patterns_in_docx(
     patterns: list of dicts {"pattern": ..., "replacement": ...}, replacement may be string or callable.
     ocr_langs: string for pytesseract languages, e.g. "eng+chi_sim+chi_tra"
     include_images: bool (we always True by default)
-    progress_callback: function(percent: float)
+    progress_callback: function(percent: float) where percent is clamped [0,100]
+    Returns: dict with summary: {'text_parts': int, 'total_media': int, 'images_processed': int}
     """
     # Compile patterns
     compiled = []
@@ -196,6 +197,10 @@ def replace_patterns_in_docx(
             # skip invalid
             continue
 
+    text_parts = 0
+    total_media = 0
+    images_processed = 0
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         # Unzip DOCX
@@ -205,8 +210,8 @@ def replace_patterns_in_docx(
         # Prepare xml parts
         xml_rel_paths = ['word/document.xml'] + [f"word/header{i}.xml" for i in range(1, 4)] + [f"word/footer{i}.xml" for i in range(1, 4)]
         total_xml = sum(1 for rel in xml_rel_paths if (tmpdir_path / rel).exists())
+        text_parts = total_xml
         media_dir = tmpdir_path / 'word' / 'media'
-        total_media = 0
         if include_images and media_dir.exists():
             total_media = sum(1 for f in media_dir.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp'])
         total = total_xml + total_media if (total_xml + total_media) > 0 else 1
@@ -245,8 +250,10 @@ def replace_patterns_in_docx(
             except Exception:
                 pass
             count += 1
+            # Clamp percent
             if progress_callback:
-                percent = 100 * count / total
+                percent = int(round(100 * count / total))
+                percent = max(0, min(100, percent))
                 progress_callback(percent)
 
         # Image OCR replacements
@@ -256,12 +263,19 @@ def replace_patterns_in_docx(
                     try:
                         img_bytes = img_file.read_bytes()
                         new_bytes = process_image_bytes(img_bytes, ocr_langs, compiled)
+                        # If changed, we count as processed
+                        if new_bytes != img_bytes:
+                            images_processed += 1
+                        else:
+                            # even if unchanged, count as attempted
+                            images_processed += 1
                         img_file.write_bytes(new_bytes)
                     except Exception:
                         pass
                 count += 1
                 if progress_callback:
-                    percent = 100 * count / total
+                    percent = int(round(100 * count / total))
+                    percent = max(0, min(100, percent))
                     progress_callback(percent)
 
         # Repack DOCX
@@ -271,6 +285,12 @@ def replace_patterns_in_docx(
                     full = Path(folder) / fname
                     arc = full.relative_to(tmpdir_path)
                     zout.write(str(full), str(arc))
+
+    return {
+        'text_parts': text_parts,
+        'total_media': total_media,
+        'images_processed': images_processed
+    }
 
 def load_patterns():
     """Sidebar UI: load patterns from JSON upload or manual entry."""
@@ -404,6 +424,7 @@ def compare_document_pair(orig_file, proc_file):
     orig_file, proc_file: UploadedFile-like with .name and .getbuffer()
     Returns dict with keys: original, processed, text_diff_html, orig_images, proc_images, error
     """
+    orig_path = proc_path = None
     try:
         # Save to temp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
@@ -441,8 +462,7 @@ def compare_document_pair(orig_file, proc_file):
         }
     finally:
         # Clean up temp files
-        for path in ('orig_path', 'proc_path'):
-            p = locals().get(path)
+        for p in (orig_path, proc_path):
             try:
                 if p and os.path.exists(p):
                     os.unlink(p)
@@ -498,19 +518,24 @@ def single_file_page(patterns, ocr_langs, include_images):
 
         status.text("🔄 Processing...")
         try:
-            replace_patterns_in_docx(
+            summary = replace_patterns_in_docx(
                 input_path=converted_path,
                 output_path=out_path,
                 patterns=patterns,
                 ocr_langs=ocr_langs,
                 include_images=include_images,
-                progress_callback=lambda p: progress_bar.progress(int(p))
+                progress_callback=lambda p: progress_bar.progress(max(0, min(100, int(p))))
             )
         except Exception as e:
             st.error(f"Error: {e}")
             return
         elapsed = time.time() - start_time
         status.success(f"✅ Done in {int(elapsed)} sec")
+
+        # Confirm image processing
+        imgs = summary.get('images_processed', 0)
+        total_media = summary.get('total_media', 0)
+        st.info(f"Images processed: {imgs} of {total_media}")
 
         # Preview modified text
         with st.expander("📝 Modified Text Preview", expanded=False):
@@ -583,8 +608,10 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     results.append({
                         'file': uploaded.name,
                         'status': f'❌ Conversion failed: {e}',
-                        'time': '0',
-                        'path': None
+                        'time': '0s',
+                        'path': None,
+                        'images': 0,
+                        'total_media': 0
                     })
                     try: os.unlink(tmp_path)
                     except: pass
@@ -594,28 +621,32 @@ def batch_processing_page(patterns, ocr_langs, include_images):
             out_name = f"processed_{Path(uploaded.name).stem}.docx"
             out_path = os.path.join(output_dir, out_name)
             try:
-                replace_patterns_in_docx(
+                summary = replace_patterns_in_docx(
                     input_path=converted_path,
                     output_path=out_path,
                     patterns=patterns,
                     ocr_langs=ocr_langs,
                     include_images=include_images,
-                    progress_callback=None  # no per-file progress UI here
+                    progress_callback=None  # for batch, skip per-file progress UI
                 )
                 elapsed = time.time() - file_start
                 results.append({
                     'file': uploaded.name,
                     'status': '✅ Success',
-                    'time': str(int(elapsed)) + "s",
-                    'path': out_path
+                    'time': f"{int(elapsed)}s",
+                    'path': out_path,
+                    'images': summary.get('images_processed', 0),
+                    'total_media': summary.get('total_media', 0)
                 })
             except Exception as e:
                 elapsed = time.time() - file_start
                 results.append({
                     'file': uploaded.name,
                     'status': f'❌ Error: {e}',
-                    'time': str(int(elapsed)) + "s",
-                    'path': None
+                    'time': f"{int(elapsed)}s",
+                    'path': None,
+                    'images': 0,
+                    'total_media': 0
                 })
             finally:
                 try: os.unlink(tmp_path)
@@ -630,7 +661,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
         # Show results and downloads
         for res in results:
             if res['status'].startswith('✅') and res['path'] and os.path.exists(res['path']):
-                st.write(f"✅ {res['file']} (time: {res['time']})")
+                st.write(f"✅ {res['file']} (time: {res['time']}, images processed: {res['images']} of {res['total_media']})")
                 with open(res['path'], "rb") as f:
                     st.download_button(
                         label=f"⬇️ Download {Path(res['path']).name}",
