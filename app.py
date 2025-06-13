@@ -201,9 +201,9 @@ def replace_patterns_in_docx(
 ):
     """
     Unpack DOCX at input_path, apply:
-      - Text in document: if pattern found in a run, append ',4022-...' after original text run.
-        We now also copy the original run’s <w:rPr> so that formatting in textboxes (and all text)
-        is preserved and appended text wraps correctly.
+      - Text in document: if pattern found in a run,
+        append ',4022-...' after original text run.
+        Only copy run properties (for wrapping/formatting) when the run is inside a textbox.
       - Images: replace matched text via OCR.
     Then repack to output_path.
 
@@ -275,15 +275,20 @@ def replace_patterns_in_docx(
         total_steps = max(1, text_parts + total_media)
         step = 0
 
-        # Process text parts: append replacement after original run, copying run properties
+        # Process text parts
         for rel in existing_xml:
             xml_file = tmpdir_path / rel
             try:
                 tree = ET.parse(str(xml_file))
                 root = tree.getroot()
 
-                # For each paragraph <w:p> anywhere, including inside <w:txbxContent>
-                for p in root.findall('.//w:p', ns):
+                # First, collect paragraphs inside textboxes:
+                textbox_paras = set(root.findall('.//w:txbxContent//w:p', ns))
+                # All paragraphs:
+                all_paras = root.findall('.//w:p', ns)
+
+                for p in all_paras:
+                    in_textbox = p in textbox_paras
                     # List of runs
                     runs = list(p.findall('w:r', ns))
                     for idx, r in enumerate(runs):
@@ -316,15 +321,16 @@ def replace_patterns_in_docx(
                             if appended_texts:
                                 # Combine appended texts separated by commas, prefix comma
                                 combined = "," + ",".join(appended_texts)
-                                # Create new run <w:r> with copied <w:rPr> if exists
+                                # Create new run <w:r>
                                 new_r = ET.Element(f"{{{W_NAMESPACE}}}r")
-                                # Copy run properties to preserve formatting (bold, font, size, etc.), crucial in textboxes
-                                orig_rpr = r.find('w:rPr', ns)
-                                if orig_rpr is not None:
-                                    new_rpr = deepcopy(orig_rpr)
-                                    new_r.append(new_rpr)
+                                if in_textbox:
+                                    # Copy run properties so formatting/wrapping preserved
+                                    orig_rpr = r.find('w:rPr', ns)
+                                    if orig_rpr is not None:
+                                        new_rpr = deepcopy(orig_rpr)
+                                        new_r.append(new_rpr)
+                                # Otherwise (not in textbox), do not copy run properties
                                 new_t = ET.SubElement(new_r, f"{{{W_NAMESPACE}}}t")
-                                # Preserve spaces
                                 new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
                                 new_t.text = combined
                                 # Insert after current run
@@ -496,34 +502,45 @@ def check_tesseract():
 
 def match_files(original_files, processed_files):
     """
-    Match UploadedFile lists by stem names.
-    Returns list of (orig, proc), unmatched_originals, unmatched_processed.
-    Matching logic:
-    - If processed filename starts with 'processed_' and rest matches original stem, match.
-    - Else if stems match directly, match.
+    Match UploadedFile lists by filename (stem).
+    Returns:
+      matched: list of tuples (orig_file, proc_file)
+      unmatched_originals: list of orig_file not matched
+      unmatched_processed: list of proc_file not matched
+
+    Logic:
+    - Build a map from processed stem to processed_file
+      If processed filename stem starts with 'processed_', strip that prefix.
+    - For each original, match by stem in that map.
     """
     matched = []
     unmatched_o = []
     unmatched_p = []
+
+    # Build map: stem -> processed_file
     proc_map = {}
     for pf in processed_files:
-        name = pf.name
-        stem = Path(name).stem
+        stem = Path(pf.name).stem
         if stem.startswith("processed_"):
             orig_stem = stem[len("processed_"):]
             proc_map[orig_stem] = pf
         else:
             proc_map[stem] = pf
+
+    # Match originals
     for of in original_files:
         o_stem = Path(of.name).stem
         if o_stem in proc_map:
             matched.append((of, proc_map[o_stem]))
         else:
             unmatched_o.append(of)
-    matched_proc = set(p for _, p in matched)  # fixed variable unpack
+
+    # Determine unmatched processed by name
+    matched_proc_names = {p.name for _, p in matched}
     for pf in processed_files:
-        if pf not in matched_proc:
+        if pf.name not in matched_proc_names:
             unmatched_p.append(pf)
+
     return matched, unmatched_o, unmatched_p
 
 def compare_document_pair(orig_file, proc_file):
@@ -647,7 +664,7 @@ def single_file_page(patterns, ocr_langs, include_images):
         except Exception as e:
             st.error(f"Error: {e}")
             return
-        elapsed = time.time() - start_time
+        elapsed = time.time() -start_time
         status.success(f"✅ Done in {int(elapsed)} sec")
 
         # Final metrics
