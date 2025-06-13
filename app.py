@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 import platform
 import shutil
+from copy import deepcopy  # For copying run properties
 
 # Page config
 st.set_page_config(page_title="Document Number Processor", layout="wide")
@@ -117,12 +118,11 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         )
 
         # Build Tesseract config:
-        # - Use psm 6 (assume a single block of text) which may help detection of full patterns
+        # - Use psm 6 (assume a block of text)
         # - OEM 3
-        # - Languages: include English and Chinese if needed, but whitelist focuses on alphanumeric+hyphen
-        # - Whitelist: digits, A-Z, a-z, hyphen
+        # - Languages: English + Chinese
+        # - Whitelist: digits, letters, hyphen
         whitelist_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
-        # config string
         config = f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
 
         data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=config)
@@ -170,9 +170,7 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
                     new_txt = replaced
             if matched_this:
                 # Replace text in image: cover original region, draw new_txt
-                # Cover original area
                 cv2.rectangle(img, (x, y), (x + w0, y + h0), (255, 255, 255), -1)
-                # Draw new text
                 font_scale = max(0.5, h0 / 40)
                 thickness = max(1, int(font_scale))
                 cv2.putText(
@@ -203,8 +201,10 @@ def replace_patterns_in_docx(
 ):
     """
     Unpack DOCX at input_path, apply:
-      - Text in document: if pattern found in a run, append ',4022-...' after original text.
-      - Image OCR: replace matched text in images via OCR.
+      - Text in document: if pattern found in a run, append ',4022-...' after original text run.
+        We now also copy the original run’s <w:rPr> so that formatting in textboxes (and all text)
+        is preserved and appended text wraps correctly.
+      - Images: replace matched text via OCR.
     Then repack to output_path.
 
     patterns: list of dicts {"pattern": ..., "replacement": ...}, replacement may be string or callable.
@@ -212,7 +212,7 @@ def replace_patterns_in_docx(
     include_images: bool
     progress_callback: function(percent: int, summary: dict), percent in [0,100], summary has counters.
 
-    summary dict returned:
+    Returns summary dict:
         {
             'text_parts': int,
             'text_matches_found': int,
@@ -235,8 +235,6 @@ def replace_patterns_in_docx(
         except re.error:
             continue
         if isinstance(repl, str):
-            # If replacement string provided, but likely empty: we still need to prepend "4022-" logic?
-            # We assume user-provided replacement includes the "4022-..." or desired text.
             compiled.append((regex, repl))
         elif callable(repl):
             compiled.append((regex, repl))
@@ -277,14 +275,14 @@ def replace_patterns_in_docx(
         total_steps = max(1, text_parts + total_media)
         step = 0
 
-        # Process text parts: append replacement after original run
+        # Process text parts: append replacement after original run, copying run properties
         for rel in existing_xml:
             xml_file = tmpdir_path / rel
             try:
                 tree = ET.parse(str(xml_file))
                 root = tree.getroot()
 
-                # For each paragraph <w:p>
+                # For each paragraph <w:p> anywhere, including inside <w:txbxContent>
                 for p in root.findall('.//w:p', ns):
                     # List of runs
                     runs = list(p.findall('w:r', ns))
@@ -308,21 +306,23 @@ def replace_patterns_in_docx(
                                             except Exception:
                                                 rep = m.group(0)
                                         else:
-                                            # Replacement string: apply on m.group(0)
                                             try:
                                                 rep = regex.sub(repl, m.group(0))
                                             except re.error:
                                                 rep = m.group(0)
-                                        # Append rep
                                         appended_texts.append(rep)
                                         text_matches += 1
                                         text_replacements += 1
                             if appended_texts:
-                                # Combine appended texts separated by commas
-                                # Prepend comma so format: orig,4022-...
+                                # Combine appended texts separated by commas, prefix comma
                                 combined = "," + ",".join(appended_texts)
-                                # Create new run <w:r><w:t>
+                                # Create new run <w:r> with copied <w:rPr> if exists
                                 new_r = ET.Element(f"{{{W_NAMESPACE}}}r")
+                                # Copy run properties to preserve formatting (bold, font, size, etc.), crucial in textboxes
+                                orig_rpr = r.find('w:rPr', ns)
+                                if orig_rpr is not None:
+                                    new_rpr = deepcopy(orig_rpr)
+                                    new_r.append(new_rpr)
                                 new_t = ET.SubElement(new_r, f"{{{W_NAMESPACE}}}t")
                                 # Preserve spaces
                                 new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
@@ -520,7 +520,7 @@ def match_files(original_files, processed_files):
             matched.append((of, proc_map[o_stem]))
         else:
             unmatched_o.append(of)
-    matched_proc = set(p for _, p in matched)
+    matched_proc = set(p for _, p in matched)  # fixed variable unpack
     for pf in processed_files:
         if pf not in matched_proc:
             unmatched_p.append(pf)
