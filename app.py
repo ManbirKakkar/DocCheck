@@ -88,78 +88,110 @@ def highlight_differences(text1: str, text2: str) -> str:
             out.append(f"<span style='background:#e6ffe6'>{word}</span>")
     return " ".join(out)
 
-def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list) -> bytes:
+def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list):
     """
     OCR on image bytes, apply regex replacements from compiled_patterns (list of (regex, repl)),
-    where repl may be a string or callable(match)->str. Return possibly modified image bytes.
+    where repl may be a string or callable(match)->str. Return tuple:
+      (new_bytes, image_matches_found, image_replacements_done).
+
+    Uses a whitelist-focused Tesseract config to better find alphanumeric patterns with hyphens.
     """
     try:
         arr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
-            return image_bytes
+            return image_bytes, 0, 0
 
+        # Preprocessing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Adaptive threshold for better OCR
+        # Resize small images for better OCR
+        h, w = gray.shape
+        if max(h, w) < 1000:
+            gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
+        # Adaptive threshold to improve contrast
         gray = cv2.adaptiveThreshold(
             gray, 255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
             cv2.THRESH_BINARY,
             11, 2
         )
-        # OCR
-        config = f"--psm 4 --oem 3 -l {languages}" if languages else "--psm 4 --oem 3"
+
+        # Build Tesseract config:
+        # - Use psm 6 (assume a single block of text) which may help detection of full patterns
+        # - OEM 3
+        # - Languages: include English and Chinese if needed, but whitelist focuses on alphanumeric+hyphen
+        # - Whitelist: digits, A-Z, a-z, hyphen
+        whitelist_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
+        # config string
+        config = f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
+
         data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=config)
         n = len(data.get('text', []))
+        image_matches = 0
+        image_replacements = 0
         for i in range(n):
-            txt = data['text'][i]
+            txt = data['text'][i].strip()
+            if not txt:
+                continue
+            # Coordinates
             try:
-                conf = int(data['conf'][i])
-            except:
-                conf = 0
-            if conf > 60 and txt.strip():
-                x, y, w, h = (data[k][i] for k in ('left', 'top', 'width', 'height'))
-                new_txt = txt
-                for regex, repl in compiled_patterns:
+                x, y, w0, h0 = (data[k][i] for k in ('left', 'top', 'width', 'height'))
+            except Exception:
+                continue
+            new_txt = txt
+            matched_this = False
+            for regex, repl in compiled_patterns:
+                # Find all matches in this txt fragment
+                try:
+                    matches = list(regex.finditer(new_txt))
+                except re.error:
+                    matches = []
+                if matches:
+                    matched_this = True
+                    image_matches += len(matches)
+                    # Apply replacement on each match: usually repl produces '4022-...'
                     if callable(repl):
-                        # replacement function
                         def _fn(m):
                             try:
                                 return repl(m)
                             except Exception:
                                 return m.group(0)
                         try:
-                            new_txt = regex.sub(_fn, new_txt)
+                            replaced = regex.sub(_fn, new_txt)
                         except re.error:
-                            pass
+                            replaced = new_txt
                     else:
                         try:
-                            new_txt = regex.sub(repl, new_txt)
+                            replaced = regex.sub(repl, new_txt)
                         except re.error:
-                            pass
-                if new_txt != txt:
-                    # Cover original area with white rectangle
-                    cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), -1)
-                    # Write new text
-                    font_scale = max(0.5, h / 40)
-                    thickness = max(1, int(font_scale))
-                    cv2.putText(
-                        img,
-                        new_txt,
-                        (x, y + h),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale,
-                        (0, 0, 0),
-                        thickness,
-                        cv2.LINE_AA
-                    )
+                            replaced = new_txt
+                    if replaced != new_txt:
+                        image_replacements += len(matches)
+                    new_txt = replaced
+            if matched_this:
+                # Replace text in image: cover original region, draw new_txt
+                # Cover original area
+                cv2.rectangle(img, (x, y), (x + w0, y + h0), (255, 255, 255), -1)
+                # Draw new text
+                font_scale = max(0.5, h0 / 40)
+                thickness = max(1, int(font_scale))
+                cv2.putText(
+                    img,
+                    new_txt,
+                    (x, y + h0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (0, 0, 0),
+                    thickness,
+                    cv2.LINE_AA
+                )
         success, out = cv2.imencode('.png', img)
         if success:
-            return out.tobytes()
+            return out.tobytes(), image_matches, image_replacements
         else:
-            return image_bytes
+            return image_bytes, image_matches, image_replacements
     except Exception:
-        return image_bytes
+        return image_bytes, 0, 0
 
 def replace_patterns_in_docx(
     input_path: str,
@@ -170,13 +202,26 @@ def replace_patterns_in_docx(
     progress_callback=None
 ):
     """
-    Unpack DOCX at input_path, apply text replacements and optional image OCR replacements,
-    then repack to output_path.
+    Unpack DOCX at input_path, apply:
+      - Text in document: if pattern found in a run, append ',4022-...' after original text.
+      - Image OCR: replace matched text in images via OCR.
+    Then repack to output_path.
+
     patterns: list of dicts {"pattern": ..., "replacement": ...}, replacement may be string or callable.
-    ocr_langs: string for pytesseract languages, e.g. "eng+chi_sim+chi_tra"
-    include_images: bool (we always True by default)
-    progress_callback: function(percent: float) where percent is clamped [0,100]
-    Returns: dict with summary: {'text_parts': int, 'total_media': int, 'images_processed': int}
+    ocr_langs: e.g. "eng+chi_sim+chi_tra"
+    include_images: bool
+    progress_callback: function(percent: int, summary: dict), percent in [0,100], summary has counters.
+
+    summary dict returned:
+        {
+            'text_parts': int,
+            'text_matches_found': int,
+            'text_replacements_done': int,
+            'total_media': int,
+            'images_processed': int,
+            'image_matches_found': int,
+            'image_replacements_done': int
+        }
     """
     # Compile patterns
     compiled = []
@@ -190,16 +235,26 @@ def replace_patterns_in_docx(
         except re.error:
             continue
         if isinstance(repl, str):
+            # If replacement string provided, but likely empty: we still need to prepend "4022-" logic?
+            # We assume user-provided replacement includes the "4022-..." or desired text.
             compiled.append((regex, repl))
         elif callable(repl):
             compiled.append((regex, repl))
         else:
-            # skip invalid
             continue
 
+    # Counters
     text_parts = 0
+    text_matches = 0
+    text_replacements = 0
     total_media = 0
     images_processed = 0
+    image_matches = 0
+    image_replacements = 0
+
+    # Namespaces
+    W_NAMESPACE = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    ns = {'w': W_NAMESPACE}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
@@ -207,76 +262,128 @@ def replace_patterns_in_docx(
         with zipfile.ZipFile(input_path, 'r') as zin:
             zin.extractall(tmpdir)
 
-        # Prepare xml parts
-        xml_rel_paths = ['word/document.xml'] + [f"word/header{i}.xml" for i in range(1, 4)] + [f"word/footer{i}.xml" for i in range(1, 4)]
-        total_xml = sum(1 for rel in xml_rel_paths if (tmpdir_path / rel).exists())
-        text_parts = total_xml
+        # Identify XML parts to process
+        xml_rel_paths = ['word/document.xml'] + \
+                        [f"word/header{i}.xml" for i in range(1, 4)] + \
+                        [f"word/footer{i}.xml" for i in range(1, 4)]
+        existing_xml = [rel for rel in xml_rel_paths if (tmpdir_path / rel).exists()]
+        text_parts = len(existing_xml)
+
+        # Count images
         media_dir = tmpdir_path / 'word' / 'media'
         if include_images and media_dir.exists():
             total_media = sum(1 for f in media_dir.iterdir() if f.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp'])
-        total = total_xml + total_media if (total_xml + total_media) > 0 else 1
-        count = 0
+        # Total steps for progress
+        total_steps = max(1, text_parts + total_media)
+        step = 0
 
-        # Text replacements
-        for rel in xml_rel_paths:
+        # Process text parts: append replacement after original run
+        for rel in existing_xml:
             xml_file = tmpdir_path / rel
-            if not xml_file.exists():
-                continue
             try:
                 tree = ET.parse(str(xml_file))
                 root = tree.getroot()
-                ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-                for t in root.findall('.//w:t', ns):
-                    if t.text:
-                        new_text = t.text
-                        for regex, repl in compiled:
-                            if callable(repl):
-                                def _fn(m):
-                                    try:
-                                        return repl(m)
-                                    except Exception:
-                                        return m.group(0)
+
+                # For each paragraph <w:p>
+                for p in root.findall('.//w:p', ns):
+                    # List of runs
+                    runs = list(p.findall('w:r', ns))
+                    for idx, r in enumerate(runs):
+                        t = r.find('w:t', ns)
+                        if t is not None and t.text:
+                            orig_text = t.text
+                            appended_texts = []
+                            # For each pattern, find matches
+                            for regex, repl in compiled:
                                 try:
-                                    new_text = regex.sub(_fn, new_text)
+                                    matches = list(regex.finditer(orig_text))
                                 except re.error:
-                                    pass
-                            else:
-                                try:
-                                    new_text = regex.sub(repl, new_text)
-                                except re.error:
-                                    pass
-                        t.text = new_text
+                                    matches = []
+                                if matches:
+                                    for m in matches:
+                                        # Build replacement text
+                                        if callable(repl):
+                                            try:
+                                                rep = repl(m)
+                                            except Exception:
+                                                rep = m.group(0)
+                                        else:
+                                            # Replacement string: apply on m.group(0)
+                                            try:
+                                                rep = regex.sub(repl, m.group(0))
+                                            except re.error:
+                                                rep = m.group(0)
+                                        # Append rep
+                                        appended_texts.append(rep)
+                                        text_matches += 1
+                                        text_replacements += 1
+                            if appended_texts:
+                                # Combine appended texts separated by commas
+                                # Prepend comma so format: orig,4022-...
+                                combined = "," + ",".join(appended_texts)
+                                # Create new run <w:r><w:t>
+                                new_r = ET.Element(f"{{{W_NAMESPACE}}}r")
+                                new_t = ET.SubElement(new_r, f"{{{W_NAMESPACE}}}t")
+                                # Preserve spaces
+                                new_t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
+                                new_t.text = combined
+                                # Insert after current run
+                                children = list(p)
+                                insert_idx = None
+                                for i_ch, ch in enumerate(children):
+                                    if ch is r:
+                                        insert_idx = i_ch + 1
+                                        break
+                                if insert_idx is not None:
+                                    p.insert(insert_idx, new_r)
+                                else:
+                                    p.append(new_r)
+                # Save XML
                 tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
             except Exception:
                 pass
-            count += 1
-            # Clamp percent
+            step += 1
             if progress_callback:
-                percent = int(round(100 * count / total))
+                percent = int(round(100 * step / total_steps))
                 percent = max(0, min(100, percent))
-                progress_callback(percent)
+                summary = {
+                    'text_parts': text_parts,
+                    'text_matches_found': text_matches,
+                    'text_replacements_done': text_replacements,
+                    'total_media': total_media,
+                    'images_processed': images_processed,
+                    'image_matches_found': image_matches,
+                    'image_replacements_done': image_replacements
+                }
+                progress_callback(percent, summary)
 
-        # Image OCR replacements
+        # Process images via OCR and replacement
         if include_images and media_dir.exists():
             for img_file in media_dir.iterdir():
                 if img_file.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp']:
                     try:
                         img_bytes = img_file.read_bytes()
-                        new_bytes = process_image_bytes(img_bytes, ocr_langs, compiled)
-                        # If changed, we count as processed
-                        if new_bytes != img_bytes:
-                            images_processed += 1
-                        else:
-                            # even if unchanged, count as attempted
-                            images_processed += 1
+                        new_bytes, im_matches, im_repls = process_image_bytes(img_bytes, ocr_langs, compiled)
+                        images_processed += 1
+                        image_matches += im_matches
+                        image_replacements += im_repls
                         img_file.write_bytes(new_bytes)
                     except Exception:
                         pass
-                count += 1
-                if progress_callback:
-                    percent = int(round(100 * count / total))
-                    percent = max(0, min(100, percent))
-                    progress_callback(percent)
+                    step += 1
+                    if progress_callback:
+                        percent = int(round(100 * step / total_steps))
+                        percent = max(0, min(100, percent))
+                        summary = {
+                            'text_parts': text_parts,
+                            'text_matches_found': text_matches,
+                            'text_replacements_done': text_replacements,
+                            'total_media': total_media,
+                            'images_processed': images_processed,
+                            'image_matches_found': image_matches,
+                            'image_replacements_done': image_replacements
+                        }
+                        progress_callback(percent, summary)
 
         # Repack DOCX
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -288,8 +395,12 @@ def replace_patterns_in_docx(
 
     return {
         'text_parts': text_parts,
+        'text_matches_found': text_matches,
+        'text_replacements_done': text_replacements,
         'total_media': total_media,
-        'images_processed': images_processed
+        'images_processed': images_processed,
+        'image_matches_found': image_matches,
+        'image_replacements_done': image_replacements
     }
 
 def load_patterns():
@@ -328,7 +439,7 @@ def load_patterns():
             patterns = []
     # Default if none or invalid
     if not patterns:
-        st.sidebar.info("Using default pattern: 77-(2–4 chars)-(5–7 chars)-optional(2–4 chars) → 4022-...")
+        st.sidebar.info("Using default pattern: 77-(2–4 chars)-(5–7 chars)-optional(2–4 chars) → append 4022-...")
         default_pattern = r"\b77\s*[-–—]?\s*([A-Za-z0-9]{2,4})\s*[-–—]?\s*([A-Za-z0-9]{5,7})(?:\s*[-–—]?\s*([A-Za-z0-9]{2,4}))?\b"
         def default_repl(m):
             g1 = m.group(1)
@@ -394,7 +505,6 @@ def match_files(original_files, processed_files):
     matched = []
     unmatched_o = []
     unmatched_p = []
-    # Build map for processed: key -> UploadedFile
     proc_map = {}
     for pf in processed_files:
         name = pf.name
@@ -410,10 +520,7 @@ def match_files(original_files, processed_files):
             matched.append((of, proc_map[o_stem]))
         else:
             unmatched_o.append(of)
-    # Any processed not matched?
-    matched_proc = set()
-    for o, p in matched:
-        matched_proc.add(p)
+    matched_proc = set(p for _, p in matched)
     for pf in processed_files:
         if pf not in matched_proc:
             unmatched_p.append(pf)
@@ -426,7 +533,6 @@ def compare_document_pair(orig_file, proc_file):
     """
     orig_path = proc_path = None
     try:
-        # Save to temp
         with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as f:
             f.write(orig_file.getbuffer())
             orig_path = f.name
@@ -434,12 +540,10 @@ def compare_document_pair(orig_file, proc_file):
             f2.write(proc_file.getbuffer())
             proc_path = f2.name
 
-        # Extract text
         orig_text = extract_text_from_docx(orig_path)
         proc_text = extract_text_from_docx(proc_path)
         text_diff_html = highlight_differences(orig_text, proc_text)
 
-        # Extract images
         orig_images = extract_images_from_docx(orig_path)
         proc_images = extract_images_from_docx(proc_path)
 
@@ -461,7 +565,6 @@ def compare_document_pair(orig_file, proc_file):
             'error': str(e)
         }
     finally:
-        # Clean up temp files
         for p in (orig_path, proc_path):
             try:
                 if p and os.path.exists(p):
@@ -477,14 +580,12 @@ def single_file_page(patterns, ocr_langs, include_images):
     if not uploaded:
         st.info("Please upload a file to proceed.")
         return
-    # Save uploaded to temp file
     suffix = Path(uploaded.name).suffix.lower()
     tmp_in = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     tmp_in.write(uploaded.getbuffer())
     tmp_in_path = tmp_in.name
     tmp_in.close()
 
-    # Convert if .doc
     converted_path = tmp_in_path
     if suffix == ".doc":
         st.info("Attempting .doc → .docx conversion...")
@@ -496,7 +597,6 @@ def single_file_page(patterns, ocr_langs, include_images):
             st.error(f".doc conversion failed: {e}")
             return
 
-    # Preview original text
     with st.expander("📝 Original Text Preview", expanded=False):
         try:
             orig_text = extract_text_from_docx(converted_path)
@@ -507,16 +607,34 @@ def single_file_page(patterns, ocr_langs, include_images):
     if st.button("▶️ Run Replacement (Single)"):
         progress_bar = st.progress(0)
         status = st.empty()
+        metrics_area = st.empty()
         start_time = time.time()
 
-        # Output directory input
         output_dir = st.text_input("Output directory on server", value="output_docs")
         os.makedirs(output_dir, exist_ok=True)
-        # Save under same path and name: processed_<stem>.docx
         out_name = f"processed_{Path(uploaded.name).stem}.docx"
         out_path = os.path.join(output_dir, out_name)
 
         status.text("🔄 Processing...")
+        # Live callback
+        def callback(percent, summary):
+            try:
+                progress_bar.progress(percent)
+            except Exception:
+                pass
+            elapsed = time.time() - start_time
+            tm = summary.get('text_matches_found', 0)
+            tr = summary.get('text_replacements_done', 0)
+            im_p = summary.get('images_processed', 0)
+            tot_m = summary.get('total_media', 0)
+            im_m = summary.get('image_matches_found', 0)
+            im_r = summary.get('image_replacements_done', 0)
+            metrics_area.markdown(
+                f"Elapsed: {int(elapsed)}s | Text parts: {summary.get('text_parts',0)} | "
+                f"Text matches: {tm} | Text appended: {tr} | "
+                f"Images processed: {im_p}/{tot_m} | Image matches: {im_m} | Image replacements: {im_r}"
+            )
+
         try:
             summary = replace_patterns_in_docx(
                 input_path=converted_path,
@@ -524,7 +642,7 @@ def single_file_page(patterns, ocr_langs, include_images):
                 patterns=patterns,
                 ocr_langs=ocr_langs,
                 include_images=include_images,
-                progress_callback=lambda p: progress_bar.progress(max(0, min(100, int(p))))
+                progress_callback=callback
             )
         except Exception as e:
             st.error(f"Error: {e}")
@@ -532,12 +650,18 @@ def single_file_page(patterns, ocr_langs, include_images):
         elapsed = time.time() - start_time
         status.success(f"✅ Done in {int(elapsed)} sec")
 
-        # Confirm image processing
-        imgs = summary.get('images_processed', 0)
-        total_media = summary.get('total_media', 0)
-        st.info(f"Images processed: {imgs} of {total_media}")
+        # Final metrics
+        tm = summary.get('text_matches_found', 0)
+        tr = summary.get('text_replacements_done', 0)
+        im_p = summary.get('images_processed', 0)
+        tot_m = summary.get('total_media', 0)
+        im_m = summary.get('image_matches_found', 0)
+        im_r = summary.get('image_replacements_done', 0)
+        st.info(
+            f"Final: Text matches: {tm}, Text appended: {tr}; "
+            f"Images processed: {im_p}/{tot_m}, Image matches: {im_m}, Image replacements: {im_r}"
+        )
 
-        # Preview modified text
         with st.expander("📝 Modified Text Preview", expanded=False):
             try:
                 mod_text = extract_text_from_docx(out_path)
@@ -545,7 +669,6 @@ def single_file_page(patterns, ocr_langs, include_images):
                 mod_text = f"Error: {e}"
             st.text_area("Modified text", mod_text, height=200)
 
-        # Diff
         status.text("🔍 Generating diff...")
         try:
             diff_html = highlight_differences(orig_text, mod_text)
@@ -554,7 +677,6 @@ def single_file_page(patterns, ocr_langs, include_images):
         with st.expander("🗒️ Inline Diff", expanded=True):
             st.markdown(diff_html, unsafe_allow_html=True)
 
-        # Download and inform storage
         st.success(f"Processed file saved at: {os.path.abspath(out_path)}")
         with open(out_path, "rb") as f:
             st.download_button(
@@ -586,19 +708,17 @@ def batch_processing_page(patterns, ocr_langs, include_images):
 
     if st.button("🔁 Process Documents (Batch)"):
         total = len(uploaded_files)
-        global_progress = st.progress(0)
+        global_progress = st.progress(0.0)
         global_status = st.empty()
         start_time = time.time()
         results = []
         for idx, uploaded in enumerate(uploaded_files):
             file_start = time.time()
             global_status.info(f"Processing {idx+1}/{total}: {uploaded.name}")
-            # Save to temp
             suffix = Path(uploaded.name).suffix.lower()
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmpf:
                 tmpf.write(uploaded.getbuffer())
                 tmp_path = tmpf.name
-            # Convert if .doc
             converted_path = tmp_path
             if suffix == ".doc":
                 try:
@@ -610,16 +730,20 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                         'status': f'❌ Conversion failed: {e}',
                         'time': '0s',
                         'path': None,
-                        'images': 0,
-                        'total_media': 0
+                        'text_matches': 0,
+                        'text_appended': 0,
+                        'images_processed': 0,
+                        'total_media': 0,
+                        'image_matches': 0,
+                        'image_replacements': 0
                     })
                     try: os.unlink(tmp_path)
                     except: pass
                     global_progress.progress((idx+1)/total)
                     continue
-            # Output path
             out_name = f"processed_{Path(uploaded.name).stem}.docx"
             out_path = os.path.join(output_dir, out_name)
+
             try:
                 summary = replace_patterns_in_docx(
                     input_path=converted_path,
@@ -627,7 +751,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     patterns=patterns,
                     ocr_langs=ocr_langs,
                     include_images=include_images,
-                    progress_callback=None  # for batch, skip per-file progress UI
+                    progress_callback=None  # skip live callback in batch
                 )
                 elapsed = time.time() - file_start
                 results.append({
@@ -635,8 +759,12 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     'status': '✅ Success',
                     'time': f"{int(elapsed)}s",
                     'path': out_path,
-                    'images': summary.get('images_processed', 0),
-                    'total_media': summary.get('total_media', 0)
+                    'text_matches': summary.get('text_matches_found', 0),
+                    'text_appended': summary.get('text_replacements_done', 0),
+                    'images_processed': summary.get('images_processed', 0),
+                    'total_media': summary.get('total_media', 0),
+                    'image_matches': summary.get('image_matches_found', 0),
+                    'image_replacements': summary.get('image_replacements_done', 0)
                 })
             except Exception as e:
                 elapsed = time.time() - file_start
@@ -645,8 +773,12 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     'status': f'❌ Error: {e}',
                     'time': f"{int(elapsed)}s",
                     'path': None,
-                    'images': 0,
-                    'total_media': 0
+                    'text_matches': 0,
+                    'text_appended': 0,
+                    'images_processed': 0,
+                    'total_media': 0,
+                    'image_matches': 0,
+                    'image_replacements': 0
                 })
             finally:
                 try: os.unlink(tmp_path)
@@ -661,7 +793,10 @@ def batch_processing_page(patterns, ocr_langs, include_images):
         # Show results and downloads
         for res in results:
             if res['status'].startswith('✅') and res['path'] and os.path.exists(res['path']):
-                st.write(f"✅ {res['file']} (time: {res['time']}, images processed: {res['images']} of {res['total_media']})")
+                st.write(f"✅ {res['file']} (time: {res['time']})")
+                st.write(f"   • Text matches: {res['text_matches']}, Text appended: {res['text_appended']}")
+                st.write(f"   • Images processed: {res['images_processed']}/{res['total_media']}, "
+                         f"Image matches: {res['image_matches']}, Image replacements: {res['image_replacements']}")
                 with open(res['path'], "rb") as f:
                     st.download_button(
                         label=f"⬇️ Download {Path(res['path']).name}",
@@ -694,7 +829,7 @@ def comparison_page():
     st.markdown("""
     Upload sets of original and processed DOCX files.  
     Processed files should be named `processed_<original_stem>.docx` or share the same stem.
-    The app will match by stem and show inline text diffs and image comparisons.
+    The app will match by stem and show inline text diffs and side-by-side image comparisons.
     """)
     col1, col2 = st.columns(2)
     with col1:
@@ -800,7 +935,6 @@ def main():
             st.sidebar.success(f"Detected Tesseract at: {pytesseract.pytesseract.tesseract_cmd}")
         else:
             st.sidebar.warning("Tesseract not found in common Windows paths.")
-        # Manual override
         custom = st.sidebar.text_input("Tesseract executable path (Windows)", value="", help="If auto-detect fails, specify full path to tesseract.exe")
         if custom:
             if os.path.exists(custom):
