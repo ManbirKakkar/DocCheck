@@ -19,9 +19,28 @@ import platform
 import shutil
 from copy import deepcopy
 import math
+import logging
+from PIL import Image
+
+# Try to import additional OCR engines
+try:
+    from paddleocr import PaddleOCR
+    PADDLEOCR_AVAILABLE = True
+except ImportError:
+    PADDLEOCR_AVAILABLE = False
+
+try:
+    import easyocr
+    EASYOCR_AVAILABLE = True
+except ImportError:
+    EASYOCR_AVAILABLE = False
 
 # Page config
 st.set_page_config(page_title="Document Number Processor", layout="wide")
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ---------------- Utility functions ----------------
 
@@ -238,9 +257,231 @@ def draw_text_within_bounds(image, text, x, y, width, height, color=(0, 0, 0)):
         
         start_y += h + 5  # Move to next line
 
-def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list):
+def tesseract_ocr(image, languages, whitelist):
+    """Perform OCR using Tesseract"""
+    # Preprocessing
+    preprocessed = enhance_image_for_ocr(image)
+    
+    # OCR configuration
+    config = f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist}"
+    
+    try:
+        data = pytesseract.image_to_data(
+            preprocessed, 
+            output_type=pytesseract.Output.DICT, 
+            config=config
+        )
+        return data
+    except Exception as e:
+        logger.error(f"Tesseract OCR failed: {e}")
+        return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+
+def paddle_ocr(image, languages):
+    """Perform OCR using PaddleOCR if available"""
+    if not PADDLEOCR_AVAILABLE:
+        return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+    
+    try:
+        # Convert to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Initialize PaddleOCR
+        ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+        
+        # Perform OCR
+        result = ocr.ocr(image_rgb, cls=True)
+        
+        # Process results
+        texts = []
+        lefts = []
+        tops = []
+        widths = []
+        heights = []
+        confs = []
+        
+        for line in result:
+            if line is None:
+                continue
+            for item in line:
+                if item is None:
+                    continue
+                points, (text, conf) = item
+                if not text.strip():
+                    continue
+                
+                # Extract bounding box coordinates
+                x_coords = [p[0] for p in points]
+                y_coords = [p[1] for p in points]
+                x = min(x_coords)
+                y = min(y_coords)
+                w = max(x_coords) - x
+                h = max(y_coords) - y
+                
+                texts.append(text)
+                lefts.append(int(x))
+                tops.append(int(y))
+                widths.append(int(w))
+                heights.append(int(h))
+                confs.append(conf * 100)  # Convert to percentage
+        
+        return {
+            'text': texts,
+            'left': lefts,
+            'top': tops,
+            'width': widths,
+            'height': heights,
+            'conf': confs
+        }
+    except Exception as e:
+        logger.error(f"PaddleOCR failed: {e}")
+        return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+
+def easy_ocr(image, languages):
+    """Perform OCR using EasyOCR if available"""
+    if not EASYOCR_AVAILABLE:
+        return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+    
+    try:
+        # Convert to RGB
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Initialize EasyOCR
+        reader = easyocr.Reader(['en'])
+        
+        # Perform OCR
+        result = reader.readtext(image_rgb)
+        
+        # Process results
+        texts = []
+        lefts = []
+        tops = []
+        widths = []
+        heights = []
+        confs = []
+        
+        for item in result:
+            points, text, conf = item
+            if not text.strip():
+                continue
+            
+            # Extract bounding box coordinates
+            x_coords = [p[0] for p in points]
+            y_coords = [p[1] for p in points]
+            x = min(x_coords)
+            y = min(y_coords)
+            w = max(x_coords) - x
+            h = max(y_coords) - y
+            
+            texts.append(text)
+            lefts.append(int(x))
+            tops.append(int(y))
+            widths.append(int(w))
+            heights.append(int(h))
+            confs.append(conf * 100)  # Convert to percentage
+        
+        return {
+            'text': texts,
+            'left': lefts,
+            'top': tops,
+            'width': widths,
+            'height': heights,
+            'conf': confs
+        }
+    except Exception as e:
+        logger.error(f"EasyOCR failed: {e}")
+        return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+
+def combine_ocr_results(tesseract_data, paddle_data, easy_data):
+    """Combine results from multiple OCR engines, prioritizing Tesseract"""
+    combined = {
+        'text': [],
+        'left': [],
+        'top': [],
+        'width': [],
+        'height': [],
+        'conf': []
+    }
+    
+    # Add Tesseract results
+    combined['text'].extend(tesseract_data['text'])
+    combined['left'].extend(tesseract_data['left'])
+    combined['top'].extend(tesseract_data['top'])
+    combined['width'].extend(tesseract_data['width'])
+    combined['height'].extend(tesseract_data['height'])
+    combined['conf'].extend(tesseract_data['conf'])
+    
+    # Add PaddleOCR results that don't overlap significantly with Tesseract
+    for i in range(len(paddle_data['text'])):
+        paddle_rect = (paddle_data['left'][i], paddle_data['top'][i], 
+                      paddle_data['width'][i], paddle_data['height'][i])
+        overlap = False
+        
+        for j in range(len(combined['text'])):
+            tesseract_rect = (combined['left'][j], combined['top'][j],
+                             combined['width'][j], combined['height'][j])
+            
+            # Check for significant overlap
+            if has_significant_overlap(paddle_rect, tesseract_rect):
+                overlap = True
+                break
+        
+        if not overlap:
+            combined['text'].append(paddle_data['text'][i])
+            combined['left'].append(paddle_data['left'][i])
+            combined['top'].append(paddle_data['top'][i])
+            combined['width'].append(paddle_data['width'][i])
+            combined['height'].append(paddle_data['height'][i])
+            combined['conf'].append(paddle_data['conf'][i])
+    
+    # Add EasyOCR results that don't overlap significantly with existing results
+    for i in range(len(easy_data['text'])):
+        easy_rect = (easy_data['left'][i], easy_data['top'][i], 
+                    easy_data['width'][i], easy_data['height'][i])
+        overlap = False
+        
+        for j in range(len(combined['text'])):
+            existing_rect = (combined['left'][j], combined['top'][j],
+                            combined['width'][j], combined['height'][j])
+            
+            # Check for significant overlap
+            if has_significant_overlap(easy_rect, existing_rect):
+                overlap = True
+                break
+        
+        if not overlap:
+            combined['text'].append(easy_data['text'][i])
+            combined['left'].append(easy_data['left'][i])
+            combined['top'].append(easy_data['top'][i])
+            combined['width'].append(easy_data['width'][i])
+            combined['height'].append(easy_data['height'][i])
+            combined['conf'].append(easy_data['conf'][i])
+    
+    return combined
+
+def has_significant_overlap(rect1, rect2, threshold=0.5):
+    """Check if two rectangles have significant overlap"""
+    x1, y1, w1, h1 = rect1
+    x2, y2, w2, h2 = rect2
+    
+    # Calculate intersection area
+    x_left = max(x1, x2)
+    y_top = max(y1, y2)
+    x_right = min(x1 + w1, x2 + w2)
+    y_bottom = min(y1 + h1, y2 + h2)
+    
+    if x_right < x_left or y_bottom < y_top:
+        return False
+    
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    area1 = w1 * h1
+    area2 = w2 * h2
+    
+    # Check if intersection area is significant relative to either rectangle
+    return (intersection_area / min(area1, area2)) > threshold
+
+def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list, use_multiple_ocr: bool):
     """
-    Enhanced OCR with robust pattern detection and text fitting
+    Enhanced OCR with multiple engines and robust pattern detection
     Return tuple: (original_bytes, processed_bytes, matches_found, replacements_done)
     """
     try:
@@ -254,85 +495,72 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         # Create a copy for processing
         processed_img = original_img.copy()
         
-        # Enhanced preprocessing
-        preprocessed = enhance_image_for_ocr(original_img)
-        
-        # OCR configuration - try multiple approaches
+        # Character whitelist
         whitelist_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
-        configs = [
-            f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
-            f"--psm 11 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
-            f"--psm 4 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
-            f"--psm 3 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
-            f"--psm 12 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
-        ]
+        
+        # Perform OCR with multiple engines
+        tesseract_data = tesseract_ocr(original_img, languages, whitelist_chars)
+        paddle_data = paddle_ocr(original_img, languages) if use_multiple_ocr else {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+        easy_data = easy_ocr(original_img, languages) if use_multiple_ocr else {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+        
+        # Combine results
+        if use_multiple_ocr:
+            data = combine_ocr_results(tesseract_data, paddle_data, easy_data)
+        else:
+            data = tesseract_data
         
         matches_found = 0
         replacements_done = 0
         
-        # Try multiple OCR configurations
-        all_text_data = []
-        for config in configs:
-            try:
-                data = pytesseract.image_to_data(
-                    preprocessed, 
-                    output_type=pytesseract.Output.DICT, 
-                    config=config
-                )
-                all_text_data.append(data)
-            except:
+        # Process each detected text element
+        n = len(data.get('text', []))
+        for i in range(n):
+            text = data['text'][i].strip()
+            conf = data.get('conf', [0]*n)[i]
+            
+            # Skip empty text and low confidence detections
+            if not text or conf < 60:
                 continue
-        
-        # Process each detected text element from all configurations
-        for data in all_text_data:
-            n = len(data.get('text', []))
-            for i in range(n):
-                text = data['text'][i].strip()
-                conf = data.get('conf', [0]*n)[i]
-                
-                # Skip empty text and low confidence detections
-                if not text or conf < 60:
-                    continue
-                
-                # Get bounding box coordinates
-                try:
-                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                except Exception:
-                    continue
-                
-                # Check for matches with patterns
-                for regex, repl in compiled_patterns:
-                    # Find all matches in this text segment
-                    found_matches = list(regex.finditer(text))
-                    if found_matches:
-                        matches_found += len(found_matches)
+            
+            # Get bounding box coordinates
+            try:
+                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+            except Exception:
+                continue
+            
+            # Check for matches with patterns
+            for regex, repl in compiled_patterns:
+                # Find all matches in this text segment
+                found_matches = list(regex.finditer(text))
+                if found_matches:
+                    matches_found += len(found_matches)
+                    
+                    # Apply replacements to each match
+                    new_text = text
+                    for match in found_matches:
+                        # Apply replacement
+                        if callable(repl):
+                            try:
+                                rep_str = repl(match)
+                            except Exception:
+                                rep_str = match.group(0)
+                        else:
+                            try:
+                                rep_str = regex.sub(repl, match.group(0))
+                            except re.error:
+                                rep_str = match.group(0)
                         
-                        # Apply replacements to each match
-                        new_text = text
-                        for match in found_matches:
-                            # Apply replacement
-                            if callable(repl):
-                                try:
-                                    rep_str = repl(match)
-                                except Exception:
-                                    rep_str = match.group(0)
-                            else:
-                                try:
-                                    rep_str = regex.sub(repl, match.group(0))
-                                except re.error:
-                                    rep_str = match.group(0)
-                            
-                            # Only count as replacement if text changed
-                            if rep_str != match.group(0):
-                                replacements_done += 1
-                            
-                            # Replace the matched portion
-                            new_text = new_text.replace(match.group(0), rep_str, 1)
+                        # Only count as replacement if text changed
+                        if rep_str != match.group(0):
+                            replacements_done += 1
                         
-                        # Only update if changes were made
-                        if new_text != text:
-                            # Draw text within original bounds
-                            draw_text_within_bounds(processed_img, new_text, x, y, w, h)
+                        # Replace the matched portion
+                        new_text = new_text.replace(match.group(0), rep_str, 1)
+                    
+                    # Only update if changes were made
+                    if new_text != text:
+                        # Draw text within original bounds
+                        draw_text_within_bounds(processed_img, new_text, x, y, w, h)
         
         # Convert processed image back to bytes
         success, processed_bytes = cv2.imencode('.png', processed_img)
@@ -342,6 +570,7 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         return image_bytes, processed_bytes.tobytes(), matches_found, replacements_done
         
     except Exception as e:
+        logger.error(f"Image processing failed: {e}")
         return image_bytes, image_bytes, 0, 0
 
 def insert_image_after_original(doc, img_path, rel_id, new_img_path, new_rel_id):
@@ -383,6 +612,7 @@ def replace_patterns_in_docx(
     patterns: list,
     ocr_langs: str,
     include_images: bool,
+    use_multiple_ocr: bool,
     progress_callback=None
 ):
     """
@@ -554,7 +784,7 @@ def replace_patterns_in_docx(
                     try:
                         img_bytes = img_file.read_bytes()
                         orig_bytes, processed_bytes, im_matches, im_repls = process_image_bytes(
-                            img_bytes, ocr_langs, compiled
+                            img_bytes, ocr_langs, compiled, use_multiple_ocr
                         )
                         
                         images_processed += 1
@@ -831,7 +1061,7 @@ def compare_document_pair(orig_file, proc_file):
 
 # ---------------- Main UI Pages ----------------
 
-def single_file_page(patterns, ocr_langs, include_images):
+def single_file_page(patterns, ocr_langs, include_images, use_multiple_ocr):
     st.header("Single Document Processing")
     uploaded = st.file_uploader("Upload a .doc or .docx file", type=["doc", "docx"], key="single_upload")
     if not uploaded:
@@ -899,6 +1129,7 @@ def single_file_page(patterns, ocr_langs, include_images):
                 patterns=patterns,
                 ocr_langs=ocr_langs,
                 include_images=include_images,
+                use_multiple_ocr=use_multiple_ocr,
                 progress_callback=callback
             )
         except Exception as e:
@@ -943,7 +1174,7 @@ def single_file_page(patterns, ocr_langs, include_images):
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
 
-def batch_processing_page(patterns, ocr_langs, include_images):
+def batch_processing_page(patterns, ocr_langs, include_images, use_multiple_ocr):
     st.header("📄 Batch Processing")
     st.markdown("""
     Upload multiple `.doc` or `.docx` files for processing.
@@ -1008,6 +1239,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     patterns=patterns,
                     ocr_langs=ocr_langs,
                     include_images=include_images,
+                    use_multiple_ocr=use_multiple_ocr,
                     progress_callback=None  # skip live callback in batch
                 )
                 elapsed = time.time() - file_start
@@ -1200,12 +1432,32 @@ def main():
             else:
                 st.sidebar.error("Provided Tesseract path not found")
 
-    # Check Tesseract
+    # Check OCR engine availability
+    ocr_status = {
+        "Tesseract": False,
+        "PaddleOCR": PADDLEOCR_AVAILABLE,
+        "EasyOCR": EASYOCR_AVAILABLE
+    }
+    
     try:
         tess_ver = pytesseract.get_tesseract_version()
         st.sidebar.success(f"Tesseract v{tess_ver} detected")
+        ocr_status["Tesseract"] = True
     except Exception:
-        st.sidebar.error("Tesseract not found or not configured. Image OCR disabled.")
+        st.sidebar.error("Tesseract not found or not configured. Image OCR may be limited.")
+    
+    if PADDLEOCR_AVAILABLE:
+        st.sidebar.success("PaddleOCR is available")
+    else:
+        st.sidebar.warning("PaddleOCR not installed. Run 'pip install paddleocr paddlepaddle' to enable.")
+    
+    if EASYOCR_AVAILABLE:
+        st.sidebar.success("EasyOCR is available")
+    else:
+        st.sidebar.warning("EasyOCR not installed. Run 'pip install easyocr' to enable.")
+    
+    if not any(ocr_status.values()):
+        st.sidebar.error("No OCR engines available. Image processing will be disabled.")
 
     # Navigation
     st.sidebar.divider()
@@ -1215,19 +1467,26 @@ def main():
     # Load patterns once
     patterns = load_patterns()
 
-    # OCR language selection
+    # OCR settings
     st.sidebar.subheader("OCR Settings")
     ocr_langs = st.sidebar.text_input("Tesseract Languages", value="eng+chi_sim+chi_tra", 
                                      help="Language codes separated by '+' (e.g., eng+chi_sim+chi_tra)")
     
-    # Image processing option
+    # Image processing options
     include_images = st.sidebar.checkbox("Process Images", value=True, 
                                        help="Enable OCR-based pattern detection in images")
+    
+    use_multiple_ocr = st.sidebar.checkbox("Use Multiple OCR Engines", value=True,
+                                          help="Combine Tesseract, PaddleOCR and EasyOCR for better detection")
+    
+    if not any(ocr_status.values()):
+        include_images = False
+        use_multiple_ocr = False
 
     if mode == "Single File":
-        single_file_page(patterns, ocr_langs, include_images)
+        single_file_page(patterns, ocr_langs, include_images, use_multiple_ocr)
     elif mode == "Batch Processing":
-        batch_processing_page(patterns, ocr_langs, include_images)
+        batch_processing_page(patterns, ocr_langs, include_images, use_multiple_ocr)
     elif mode == "Document Comparison":
         comparison_page()
 
