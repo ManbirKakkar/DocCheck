@@ -24,6 +24,14 @@ st.set_page_config(page_title="Document Number Processor", layout="wide")
 
 # ---------------- Utility functions ----------------
 
+def format_time(seconds):
+    """Convert seconds to HH:MM:SS format"""
+    seconds = int(seconds)
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
 def extract_text_from_docx(docx_path: str) -> str:
     """Extract all text from DOCX: document.xml, headers, footers."""
     text_chunks = []
@@ -204,7 +212,7 @@ def replace_patterns_in_docx(
       - Text in document: if pattern found in a run,
         append ',4022-...' after original text run.
         Only copy run properties (for wrapping/formatting) when the run is inside a textbox.
-      - Images: replace matched text via OCR.
+      - Images: leave original image and add new processed image below
     Then repack to output_path.
 
     patterns: list of dicts {"pattern": ..., "replacement": ...}, replacement may be string or callable.
@@ -373,7 +381,14 @@ def replace_patterns_in_docx(
                         images_processed += 1
                         image_matches += im_matches
                         image_replacements += im_repls
-                        img_file.write_bytes(new_bytes)
+                        
+                        # Save the processed image as a new file
+                        new_img_path = media_dir / f"processed_{img_file.name}"
+                        with open(new_img_path, "wb") as f:
+                            f.write(new_bytes)
+                            
+                        # Leave original image untouched and add new image below
+                        # (We'll handle this in the XML modification below)
                     except Exception:
                         pass
                     step += 1
@@ -390,6 +405,60 @@ def replace_patterns_in_docx(
                             'image_replacements_done': image_replacements
                         }
                         progress_callback(percent, summary)
+
+        # Add new images below original ones in the document
+        if include_images and media_dir.exists():
+            # We'll process each XML part again to add the new images
+            for rel in existing_xml:
+                xml_file = tmpdir_path / rel
+                try:
+                    tree = ET.parse(str(xml_file))
+                    root = tree.getroot()
+                    
+                    # Find all images in the document
+                    for p in root.findall('.//w:p', ns):
+                        for r in p.findall('w:r', ns):
+                            drawing = r.find('.//w:drawing', ns)
+                            if drawing is not None:
+                                # This run contains an image
+                                # We'll create a new paragraph with the processed image below
+                                new_p = deepcopy(p)
+                                
+                                # Find the image reference and update it to point to the processed version
+                                for elem in new_p.iter():
+                                    if 'blip' in elem.tag and 'embed' in elem.attrib:
+                                        rId = elem.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed']
+                                        # We'll update this rId to point to the processed image
+                                        # (This requires updating the .rels file - see below)
+                                        
+                                # Insert after current paragraph
+                                parent = p.getparent()
+                                index = list(parent).index(p)
+                                parent.insert(index + 1, new_p)
+                    
+                    tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
+                    
+                    # Update relationships file to add new image references
+                    rels_file = tmpdir_path / 'word' / '_rels' / (Path(rel).name + '.rels')
+                    if rels_file.exists():
+                        rels_tree = ET.parse(str(rels_file))
+                        rels_root = rels_tree.getroot()
+                        
+                        # Add new relationships for processed images
+                        for img_file in media_dir.iterdir():
+                            if img_file.name.startswith("processed_"):
+                                # Create new relationship
+                                new_rel = ET.Element('Relationship', attrib={
+                                    'Id': 'rId' + str(len(rels_root) + 1000),  # Generate unique ID
+                                    'Type': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
+                                    'Target': f'media/{img_file.name}'
+                                })
+                                rels_root.append(new_rel)
+                        
+                        rels_tree.write(str(rels_file), encoding='utf-8', xml_declaration=True)
+                        
+                except Exception:
+                    pass
 
         # Repack DOCX
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -647,7 +716,7 @@ def single_file_page(patterns, ocr_langs, include_images):
             im_m = summary.get('image_matches_found', 0)
             im_r = summary.get('image_replacements_done', 0)
             metrics_area.markdown(
-                f"Elapsed: {int(elapsed)}s | Text parts: {summary.get('text_parts',0)} | "
+                f"Elapsed: {format_time(elapsed)} | Text parts: {summary.get('text_parts',0)} | "
                 f"Text matches: {tm} | Text appended: {tr} | "
                 f"Images processed: {im_p}/{tot_m} | Image matches: {im_m} | Image replacements: {im_r}"
             )
@@ -664,8 +733,8 @@ def single_file_page(patterns, ocr_langs, include_images):
         except Exception as e:
             st.error(f"Error: {e}")
             return
-        elapsed = time.time() -start_time
-        status.success(f"✅ Done in {int(elapsed)} sec")
+        elapsed = time.time() - start_time
+        status.success(f"✅ Done in {format_time(elapsed)}")
 
         # Final metrics
         tm = summary.get('text_matches_found', 0)
@@ -774,7 +843,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                 results.append({
                     'file': uploaded.name,
                     'status': '✅ Success',
-                    'time': f"{int(elapsed)}s",
+                    'time': format_time(elapsed),
                     'path': out_path,
                     'text_matches': summary.get('text_matches_found', 0),
                     'text_appended': summary.get('text_replacements_done', 0),
@@ -788,7 +857,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                 results.append({
                     'file': uploaded.name,
                     'status': f'❌ Error: {e}',
-                    'time': f"{int(elapsed)}s",
+                    'time': format_time(elapsed),
                     'path': None,
                     'text_matches': 0,
                     'text_appended': 0,
@@ -805,7 +874,7 @@ def batch_processing_page(patterns, ocr_langs, include_images):
                     except: pass
             global_progress.progress((idx+1)/total)
         total_elapsed = time.time() - start_time
-        st.success(f"Completed {total} files in {int(total_elapsed)}s")
+        st.success(f"Completed {total} files in {format_time(total_elapsed)}")
 
         # Show results and downloads
         for res in results:
@@ -916,13 +985,13 @@ def comparison_page():
                                 with c1:
                                     st.text(f"Original Image {i+1}")
                                     if i < len(res['orig_images']):
-                                        st.image(res['orig_images'][i], use_column_width=True)
+                                        st.image(res['orig_images'][i], use_container_width=True)
                                     else:
                                         st.write("No image")
                                 with c2:
                                     st.text(f"Processed Image {i+1}")
                                     if i < len(res['proc_images']):
-                                        st.image(res['proc_images'][i], use_column_width=True)
+                                        st.image(res['proc_images'][i], use_container_width=True)
                                     else:
                                         st.write("No image")
                                 st.markdown("---")
