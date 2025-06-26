@@ -240,7 +240,7 @@ def draw_text_within_bounds(image, text, x, y, width, height, color=(0, 0, 0)):
 
 def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list):
     """
-    OCR on image bytes with enhanced processing and text fitting
+    Enhanced OCR with robust pattern detection and text fitting
     Return tuple: (original_bytes, processed_bytes, matches_found, replacements_done)
     """
     try:
@@ -262,14 +262,16 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         configs = [
             f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
             f"--psm 11 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
-            f"--psm 4 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
+            f"--psm 4 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
+            f"--psm 3 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
+            f"--psm 12 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
         ]
         
         matches_found = 0
         replacements_done = 0
         
         # Try multiple OCR configurations
-        all_data = []
+        all_text_data = []
         for config in configs:
             try:
                 data = pytesseract.image_to_data(
@@ -277,12 +279,12 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
                     output_type=pytesseract.Output.DICT, 
                     config=config
                 )
-                all_data.append(data)
+                all_text_data.append(data)
             except:
                 continue
         
-        # Process each detected text element
-        for data in all_data:
+        # Process each detected text element from all configurations
+        for data in all_text_data:
             n = len(data.get('text', []))
             for i in range(n):
                 text = data['text'][i].strip()
@@ -300,26 +302,35 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
                 
                 # Check for matches with patterns
                 for regex, repl in compiled_patterns:
-                    match = regex.search(text)
-                    if match:
-                        matches_found += 1
+                    # Find all matches in this text segment
+                    found_matches = list(regex.finditer(text))
+                    if found_matches:
+                        matches_found += len(found_matches)
                         
-                        # Apply replacement
-                        if callable(repl):
-                            try:
-                                new_text = repl(match)
-                            except Exception:
-                                new_text = text
-                        else:
-                            try:
-                                new_text = regex.sub(repl, text)
-                            except Exception:
-                                new_text = text
-                        
-                        # Only count as replacement if text changed
-                        if new_text != text:
-                            replacements_done += 1
+                        # Apply replacements to each match
+                        new_text = text
+                        for match in found_matches:
+                            # Apply replacement
+                            if callable(repl):
+                                try:
+                                    rep_str = repl(match)
+                                except Exception:
+                                    rep_str = match.group(0)
+                            else:
+                                try:
+                                    rep_str = regex.sub(repl, match.group(0))
+                                except re.error:
+                                    rep_str = match.group(0)
                             
+                            # Only count as replacement if text changed
+                            if rep_str != match.group(0):
+                                replacements_done += 1
+                            
+                            # Replace the matched portion
+                            new_text = new_text.replace(match.group(0), rep_str, 1)
+                        
+                        # Only update if changes were made
+                        if new_text != text:
                             # Draw text within original bounds
                             draw_text_within_bounds(processed_img, new_text, x, y, w, h)
         
@@ -675,11 +686,11 @@ def load_patterns():
     # Default if none or invalid
     if not patterns:
         st.sidebar.info("Using default pattern: 77-(2–4 chars)-(5–7 chars)-optional(2–4 chars) → append 4022-...")
-        default_pattern = r"\b77\s*[-–—]?\s*([A-Za-z0-9]{2,4})\s*[-–—]?\s*([A-Za-z0-9]{5,7})(?:\s*[-–—]?\s*([A-Za-z0-9]{2,4}))?\b"
+        default_pattern = r"77\s*[-–—]?\s*([A-Za-z0-9]{2,4})\s*[-–—]?\s*([A-Za-z0-9]{5,7})(?:\s*[-–—]?\s*([A-Za-z0-9]{2,4}))?"
         def default_repl(m):
             g1 = m.group(1)
             g2 = m.group(2)
-            g3 = m.group(3)
+            g3 = m.group(3) if m.group(3) else ""
             if g3:
                 return f"4022-{g1}-{g2}-{g3}"
             else:
