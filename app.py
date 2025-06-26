@@ -18,9 +18,7 @@ from pathlib import Path
 import platform
 import shutil
 from copy import deepcopy
-import fitz  # PyMuPDF for PDF handling
-import io
-from PIL import Image
+import math
 
 # Page config
 st.set_page_config(page_title="Document Number Processor", layout="wide")
@@ -113,9 +111,16 @@ def enhance_image_for_ocr(image):
     if max(h, w) < 1000:
         gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     
-    # Apply advanced preprocessing
+    # Apply multiple preprocessing techniques
     # 1. Adaptive thresholding
-    thresh = cv2.adaptiveThreshold(
+    thresh1 = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY,
+        11, 7
+    )
+    
+    thresh2 = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
@@ -123,17 +128,119 @@ def enhance_image_for_ocr(image):
     )
     
     # 2. Noise reduction
-    denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
+    denoised1 = cv2.fastNlMeansDenoising(thresh1, None, 10, 7, 21)
+    denoised2 = cv2.fastNlMeansDenoising(thresh2, None, 10, 7, 21)
     
-    # 3. Sharpening
-    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharpened = cv2.filter2D(denoised, -1, kernel)
+    # 3. Edge-preserving smoothing
+    smoothed = cv2.bilateralFilter(gray, 9, 75, 75)
     
-    return sharpened
+    # 4. Sharpening
+    kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    
+    # Combine results
+    combined = cv2.addWeighted(denoised1, 0.4, denoised2, 0.4, 0)
+    combined = cv2.addWeighted(combined, 0.7, sharpened, 0.3, 0)
+    
+    # Final thresholding
+    _, final = cv2.threshold(combined, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    return final
+
+def wrap_text(text, font, font_scale, thickness, max_width):
+    """Wrap text to fit within max_width"""
+    lines = []
+    words = text.split()
+    
+    if not words:
+        return [""]
+    
+    current_line = words[0]
+    
+    for word in words[1:]:
+        test_line = f"{current_line} {word}"
+        (w, _), _ = cv2.getTextSize(test_line, font, font_scale, thickness)
+        if w <= max_width:
+            current_line = test_line
+        else:
+            lines.append(current_line)
+            current_line = word
+    
+    lines.append(current_line)
+    return lines
+
+def calculate_font_scale(text, width, height, max_font_scale=1.5, min_font_scale=0.3):
+    """Calculate optimal font scale to fit text within boundaries"""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 1
+    padding = 5
+    
+    # Start with max font scale
+    font_scale = max_font_scale
+    while font_scale >= min_font_scale:
+        # Wrap text to fit width
+        lines = wrap_text(text, font, font_scale, thickness, width - 2 * padding)
+        
+        # Calculate total height needed
+        total_height = 0
+        max_line_width = 0
+        
+        for line in lines:
+            (w, h), _ = cv2.getTextSize(line, font, font_scale, thickness)
+            total_height += h + 5  # Add line spacing
+            if w > max_line_width:
+                max_line_width = w
+        
+        # Check if it fits
+        if total_height <= height - 2 * padding and max_line_width <= width - 2 * padding:
+            return font_scale, lines
+        
+        # Reduce font scale and try again
+        font_scale -= 0.05
+    
+    # If we reach here, use min font scale and single line
+    return min_font_scale, [text]
+
+def draw_text_within_bounds(image, text, x, y, width, height, color=(0, 0, 0)):
+    """Draw text within specified boundaries with auto scaling and wrapping"""
+    # Cover original text area
+    cv2.rectangle(image, (x, y), (x + width, y + height), (255, 255, 255), -1)
+    
+    # Calculate optimal font scale and wrap text
+    font_scale, lines = calculate_font_scale(text, width, height)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = max(1, int(font_scale * 1.5))
+    
+    # Calculate starting y position
+    total_text_height = 0
+    for line in lines:
+        (_, h), _ = cv2.getTextSize(line, font, font_scale, thickness)
+        total_text_height += h + 5
+    
+    start_y = y + (height - total_text_height) // 2
+    
+    # Draw each line
+    for i, line in enumerate(lines):
+        (w, h), _ = cv2.getTextSize(line, font, font_scale, thickness)
+        pos_x = x + (width - w) // 2
+        pos_y = start_y + h
+        
+        cv2.putText(
+            image,
+            line,
+            (pos_x, pos_y),
+            font,
+            font_scale,
+            color,
+            thickness,
+            cv2.LINE_AA
+        )
+        
+        start_y += h + 5  # Move to next line
 
 def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list):
     """
-    OCR on image bytes, apply regex replacements from compiled_patterns.
+    OCR on image bytes with enhanced processing and text fitting
     Return tuple: (original_bytes, processed_bytes, matches_found, replacements_done)
     """
     try:
@@ -150,68 +257,71 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         # Enhanced preprocessing
         preprocessed = enhance_image_for_ocr(original_img)
         
-        # OCR configuration
+        # OCR configuration - try multiple approaches
         whitelist_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
-        config = f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
-        
-        # Perform OCR
-        data = pytesseract.image_to_data(
-            preprocessed, 
-            output_type=pytesseract.Output.DICT, 
-            config=config
-        )
+        configs = [
+            f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
+            f"--psm 11 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}",
+            f"--psm 4 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
+        ]
         
         matches_found = 0
         replacements_done = 0
         
-        # Process each detected text element
-        n = len(data['text'])
-        for i in range(n):
-            text = data['text'][i].strip()
-            if not text or data['conf'][i] < 60:  # Skip low-confidence detections
-                continue
-                
-            # Get bounding box coordinates
+        # Try multiple OCR configurations
+        all_data = []
+        for config in configs:
             try:
-                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-            except Exception:
+                data = pytesseract.image_to_data(
+                    preprocessed, 
+                    output_type=pytesseract.Output.DICT, 
+                    config=config
+                )
+                all_data.append(data)
+            except:
                 continue
+        
+        # Process each detected text element
+        for data in all_data:
+            n = len(data.get('text', []))
+            for i in range(n):
+                text = data['text'][i].strip()
+                conf = data.get('conf', [0]*n)[i]
                 
-            # Check for matches with patterns
-            for regex, repl in compiled_patterns:
-                if regex.search(text):
-                    matches_found += 1
-                    
-                    # Apply replacement
-                    if callable(repl):
-                        try:
-                            new_text = repl(regex.search(text))
-                        except Exception:
-                            new_text = text
-                    else:
-                        try:
-                            new_text = regex.sub(repl, text)
-                        except Exception:
-                            new_text = text
-                    
-                    # Only count as replacement if text changed
-                    if new_text != text:
-                        replacements_done += 1
+                # Skip empty text and low confidence detections
+                if not text or conf < 60:
+                    continue
+                
+                # Get bounding box coordinates
+                try:
+                    x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
+                except Exception:
+                    continue
+                
+                # Check for matches with patterns
+                for regex, repl in compiled_patterns:
+                    match = regex.search(text)
+                    if match:
+                        matches_found += 1
                         
-                        # Draw on processed image
-                        cv2.rectangle(processed_img, (x, y), (x + w, y + h), (255, 255, 255), -1)
-                        font_scale = max(0.5, h / 40)
-                        thickness = max(1, int(font_scale))
-                        cv2.putText(
-                            processed_img,
-                            new_text,
-                            (x, y + h),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            font_scale,
-                            (0, 0, 0),
-                            thickness,
-                            cv2.LINE_AA
-                        )
+                        # Apply replacement
+                        if callable(repl):
+                            try:
+                                new_text = repl(match)
+                            except Exception:
+                                new_text = text
+                        else:
+                            try:
+                                new_text = regex.sub(repl, text)
+                            except Exception:
+                                new_text = text
+                        
+                        # Only count as replacement if text changed
+                        if new_text != text:
+                            replacements_done += 1
+                            
+                            # Draw text within original bounds
+                            draw_text_within_bounds(processed_img, new_text, x, y, w, h)
         
         # Convert processed image back to bytes
         success, processed_bytes = cv2.imencode('.png', processed_img)
@@ -238,16 +348,21 @@ def insert_image_after_original(doc, img_path, rel_id, new_img_path, new_rel_id)
                 # Check if this is the original image
                 blip = drawing.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
                 if blip is not None and blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed') == rel_id:
-                    # Create a copy of the run for the new image
-                    new_run = deepcopy(r)
+                    # Create a new paragraph with the new image
+                    new_p = ET.Element(f"{{{W_NAMESPACE}}}p")
                     
-                    # Update the relationship ID in the new run
-                    new_blip = new_run.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+                    # Copy the run and update to point to the new image
+                    new_r = deepcopy(r)
+                    new_blip = new_r.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
                     if new_blip is not None:
                         new_blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rel_id)
                     
-                    # Insert the new run after the original
-                    p.append(new_run)
+                    new_p.append(new_r)
+                    
+                    # Insert the new paragraph after the current paragraph
+                    parent = p.getparent()
+                    index = list(parent).index(p)
+                    parent.insert(index + 1, new_p)
                     return True
     return False
 
