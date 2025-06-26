@@ -17,7 +17,10 @@ import time
 from pathlib import Path
 import platform
 import shutil
-from copy import deepcopy  # For copying run properties
+from copy import deepcopy
+import fitz  # PyMuPDF for PDF handling
+import io
+from PIL import Image
 
 # Page config
 st.set_page_config(page_title="Document Number Processor", layout="wide")
@@ -97,107 +100,156 @@ def highlight_differences(text1: str, text2: str) -> str:
             out.append(f"<span style='background:#e6ffe6'>{word}</span>")
     return " ".join(out)
 
+def enhance_image_for_ocr(image):
+    """Apply advanced preprocessing to improve OCR accuracy"""
+    # Convert to grayscale
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Resize if too small
+    h, w = gray.shape
+    if max(h, w) < 1000:
+        gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # Apply advanced preprocessing
+    # 1. Adaptive thresholding
+    thresh = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11, 7
+    )
+    
+    # 2. Noise reduction
+    denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
+    
+    # 3. Sharpening
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(denoised, -1, kernel)
+    
+    return sharpened
+
 def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: list):
     """
-    OCR on image bytes, apply regex replacements from compiled_patterns (list of (regex, repl)),
-    where repl may be a string or callable(match)->str. Return tuple:
-      (new_bytes, image_matches_found, image_replacements_done).
-
-    Uses a whitelist-focused Tesseract config to better find alphanumeric patterns with hyphens.
+    OCR on image bytes, apply regex replacements from compiled_patterns.
+    Return tuple: (original_bytes, processed_bytes, matches_found, replacements_done)
     """
     try:
-        arr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return image_bytes, 0, 0
-
-        # Preprocessing
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Resize small images for better OCR
-        h, w = gray.shape
-        if max(h, w) < 1000:
-            gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-        # Adaptive threshold to improve contrast
-        gray = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            11, 2
-        )
-
-        # Build Tesseract config:
-        # - Use psm 6 (assume a block of text)
-        # - OEM 3
-        # - Languages: English + Chinese
-        # - Whitelist: digits, letters, hyphen
+        # Convert bytes to OpenCV image
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        original_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if original_img is None:
+            return image_bytes, image_bytes, 0, 0
+        
+        # Create a copy for processing
+        processed_img = original_img.copy()
+        
+        # Enhanced preprocessing
+        preprocessed = enhance_image_for_ocr(original_img)
+        
+        # OCR configuration
         whitelist_chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-"
         config = f"--psm 6 --oem 3 -l {languages} -c tessedit_char_whitelist={whitelist_chars}"
-
-        data = pytesseract.image_to_data(gray, output_type=pytesseract.Output.DICT, config=config)
-        n = len(data.get('text', []))
-        image_matches = 0
-        image_replacements = 0
+        
+        # Perform OCR
+        data = pytesseract.image_to_data(
+            preprocessed, 
+            output_type=pytesseract.Output.DICT, 
+            config=config
+        )
+        
+        matches_found = 0
+        replacements_done = 0
+        
+        # Process each detected text element
+        n = len(data['text'])
         for i in range(n):
-            txt = data['text'][i].strip()
-            if not txt:
+            text = data['text'][i].strip()
+            if not text or data['conf'][i] < 60:  # Skip low-confidence detections
                 continue
-            # Coordinates
+                
+            # Get bounding box coordinates
             try:
-                x, y, w0, h0 = (data[k][i] for k in ('left', 'top', 'width', 'height'))
+                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
             except Exception:
                 continue
-            new_txt = txt
-            matched_this = False
+                
+            # Check for matches with patterns
             for regex, repl in compiled_patterns:
-                # Find all matches in this txt fragment
-                try:
-                    matches = list(regex.finditer(new_txt))
-                except re.error:
-                    matches = []
-                if matches:
-                    matched_this = True
-                    image_matches += len(matches)
-                    # Apply replacement on each match: usually repl produces '4022-...'
+                if regex.search(text):
+                    matches_found += 1
+                    
+                    # Apply replacement
                     if callable(repl):
-                        def _fn(m):
-                            try:
-                                return repl(m)
-                            except Exception:
-                                return m.group(0)
                         try:
-                            replaced = regex.sub(_fn, new_txt)
-                        except re.error:
-                            replaced = new_txt
+                            new_text = repl(regex.search(text))
+                        except Exception:
+                            new_text = text
                     else:
                         try:
-                            replaced = regex.sub(repl, new_txt)
-                        except re.error:
-                            replaced = new_txt
-                    if replaced != new_txt:
-                        image_replacements += len(matches)
-                    new_txt = replaced
-            if matched_this:
-                # Replace text in image: cover original region, draw new_txt
-                cv2.rectangle(img, (x, y), (x + w0, y + h0), (255, 255, 255), -1)
-                font_scale = max(0.5, h0 / 40)
-                thickness = max(1, int(font_scale))
-                cv2.putText(
-                    img,
-                    new_txt,
-                    (x, y + h0),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (0, 0, 0),
-                    thickness,
-                    cv2.LINE_AA
-                )
-        success, out = cv2.imencode('.png', img)
-        if success:
-            return out.tobytes(), image_matches, image_replacements
-        else:
-            return image_bytes, image_matches, image_replacements
-    except Exception:
-        return image_bytes, 0, 0
+                            new_text = regex.sub(repl, text)
+                        except Exception:
+                            new_text = text
+                    
+                    # Only count as replacement if text changed
+                    if new_text != text:
+                        replacements_done += 1
+                        
+                        # Draw on processed image
+                        cv2.rectangle(processed_img, (x, y), (x + w, y + h), (255, 255, 255), -1)
+                        font_scale = max(0.5, h / 40)
+                        thickness = max(1, int(font_scale))
+                        cv2.putText(
+                            processed_img,
+                            new_text,
+                            (x, y + h),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            font_scale,
+                            (0, 0, 0),
+                            thickness,
+                            cv2.LINE_AA
+                        )
+        
+        # Convert processed image back to bytes
+        success, processed_bytes = cv2.imencode('.png', processed_img)
+        if not success:
+            return image_bytes, image_bytes, matches_found, replacements_done
+            
+        return image_bytes, processed_bytes.tobytes(), matches_found, replacements_done
+        
+    except Exception as e:
+        return image_bytes, image_bytes, 0, 0
+
+def insert_image_after_original(doc, img_path, rel_id, new_img_path, new_rel_id):
+    """
+    Insert a new image after the original image in the document XML
+    """
+    W_NAMESPACE = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    ns = {'w': W_NAMESPACE}
+    
+    # Find all paragraphs containing the original image
+    for p in doc.findall('.//w:p', ns):
+        for r in p.findall('w:r', ns):
+            drawing = r.find('.//w:drawing', ns)
+            if drawing is not None:
+                # Check if this is the original image
+                blip = drawing.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+                if blip is not None and blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed') == rel_id:
+                    # Create a copy of the run for the new image
+                    new_run = deepcopy(r)
+                    
+                    # Update the relationship ID in the new run
+                    new_blip = new_run.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
+                    if new_blip is not None:
+                        new_blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rel_id)
+                    
+                    # Insert the new run after the original
+                    p.append(new_run)
+                    return True
+    return False
 
 def replace_patterns_in_docx(
     input_path: str,
@@ -208,28 +260,9 @@ def replace_patterns_in_docx(
     progress_callback=None
 ):
     """
-    Unpack DOCX at input_path, apply:
-      - Text in document: if pattern found in a run,
-        append ',4022-...' after original text run.
-        Only copy run properties (for wrapping/formatting) when the run is inside a textbox.
-      - Images: leave original image and add new processed image below
-    Then repack to output_path.
-
-    patterns: list of dicts {"pattern": ..., "replacement": ...}, replacement may be string or callable.
-    ocr_langs: e.g. "eng+chi_sim+chi_tra"
-    include_images: bool
-    progress_callback: function(percent: int, summary: dict), percent in [0,100], summary has counters.
-
-    Returns summary dict:
-        {
-            'text_parts': int,
-            'text_matches_found': int,
-            'text_replacements_done': int,
-            'total_media': int,
-            'images_processed': int,
-            'image_matches_found': int,
-            'image_replacements_done': int
-        }
+    Process DOCX file with enhanced image handling:
+    - Text: append replacements after original text
+    - Images: create new image with replacements and insert below original
     """
     # Compile patterns
     compiled = []
@@ -371,25 +404,91 @@ def replace_patterns_in_docx(
                 }
                 progress_callback(percent, summary)
 
-        # Process images via OCR and replacement
+        # Process images and insert new versions below originals
         if include_images and media_dir.exists():
+            # Build relationship maps for each document part
+            rels_maps = {}
+            for rel in existing_xml:
+                rels_file = tmpdir_path / 'word' / '_rels' / (Path(rel).name + '.rels')
+                if rels_file.exists():
+                    try:
+                        rels_tree = ET.parse(str(rels_file))
+                        rels_root = rels_tree.getroot()
+                        rels_map = {}
+                        for relationship in rels_root.findall('Relationship', {'': 'http://schemas.openxmlformats.org/package/2006/relationships'}):
+                            if 'image' in relationship.get('Type', ''):
+                                rels_map[relationship.get('Id')] = relationship.get('Target')
+                        rels_maps[str(rels_file)] = rels_map
+                    except Exception:
+                        rels_maps[str(rels_file)] = {}
+            
+            # Process each image
             for img_file in media_dir.iterdir():
                 if img_file.suffix.lower() in ['.png', '.jpg', '.jpeg', '.bmp']:
                     try:
                         img_bytes = img_file.read_bytes()
-                        new_bytes, im_matches, im_repls = process_image_bytes(img_bytes, ocr_langs, compiled)
+                        orig_bytes, processed_bytes, im_matches, im_repls = process_image_bytes(
+                            img_bytes, ocr_langs, compiled
+                        )
+                        
                         images_processed += 1
                         image_matches += im_matches
                         image_replacements += im_repls
                         
-                        # Save the processed image as a new file
-                        new_img_path = media_dir / f"processed_{img_file.name}"
-                        with open(new_img_path, "wb") as f:
-                            f.write(new_bytes)
+                        # Only create new image if replacements were done
+                        if im_repls > 0:
+                            # Save processed image
+                            new_img_name = f"processed_{img_file.name}"
+                            new_img_path = media_dir / new_img_name
+                            with open(new_img_path, "wb") as f:
+                                f.write(processed_bytes)
                             
-                        # Leave original image untouched and add new image below
-                        # (We'll handle this in the XML modification below)
-                    except Exception:
+                            # Find original image in all document parts
+                            for rel in existing_xml:
+                                xml_file = tmpdir_path / rel
+                                rels_file = tmpdir_path / 'word' / '_rels' / (Path(rel).name + '.rels')
+                                rels_map = rels_maps.get(str(rels_file), {})
+                                
+                                # Find relationship ID for original image
+                                orig_rel_id = None
+                                for rid, target in rels_map.items():
+                                    if target.endswith(img_file.name):
+                                        orig_rel_id = rid
+                                        break
+                                
+                                if orig_rel_id:
+                                    try:
+                                        # Add new relationship
+                                        rels_tree = ET.parse(str(rels_file))
+                                        rels_root = rels_tree.getroot()
+                                        
+                                        # Create new relationship ID
+                                        new_rel_id = f"rId{len(rels_root) + 1000}"
+                                        ns = {'': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+                                        ET.SubElement(
+                                            rels_root, 
+                                            'Relationship', 
+                                            {
+                                                'Id': new_rel_id,
+                                                'Type': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
+                                                'Target': f'media/{new_img_name}'
+                                            }
+                                        )
+                                        
+                                        # Save updated relationships
+                                        rels_tree.write(str(rels_file), encoding='utf-8', xml_declaration=True)
+                                        
+                                        # Update XML to insert new image after original
+                                        tree = ET.parse(str(xml_file))
+                                        root = tree.getroot()
+                                        inserted = insert_image_after_original(root, img_file.name, orig_rel_id, new_img_name, new_rel_id)
+                                        if inserted:
+                                            tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
+                                            
+                                    except Exception as e:
+                                        pass
+                        
+                    except Exception as e:
                         pass
                     step += 1
                     if progress_callback:
@@ -405,60 +504,6 @@ def replace_patterns_in_docx(
                             'image_replacements_done': image_replacements
                         }
                         progress_callback(percent, summary)
-
-        # Add new images below original ones in the document
-        if include_images and media_dir.exists():
-            # We'll process each XML part again to add the new images
-            for rel in existing_xml:
-                xml_file = tmpdir_path / rel
-                try:
-                    tree = ET.parse(str(xml_file))
-                    root = tree.getroot()
-                    
-                    # Find all images in the document
-                    for p in root.findall('.//w:p', ns):
-                        for r in p.findall('w:r', ns):
-                            drawing = r.find('.//w:drawing', ns)
-                            if drawing is not None:
-                                # This run contains an image
-                                # We'll create a new paragraph with the processed image below
-                                new_p = deepcopy(p)
-                                
-                                # Find the image reference and update it to point to the processed version
-                                for elem in new_p.iter():
-                                    if 'blip' in elem.tag and 'embed' in elem.attrib:
-                                        rId = elem.attrib['{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed']
-                                        # We'll update this rId to point to the processed image
-                                        # (This requires updating the .rels file - see below)
-                                        
-                                # Insert after current paragraph
-                                parent = p.getparent()
-                                index = list(parent).index(p)
-                                parent.insert(index + 1, new_p)
-                    
-                    tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
-                    
-                    # Update relationships file to add new image references
-                    rels_file = tmpdir_path / 'word' / '_rels' / (Path(rel).name + '.rels')
-                    if rels_file.exists():
-                        rels_tree = ET.parse(str(rels_file))
-                        rels_root = rels_tree.getroot()
-                        
-                        # Add new relationships for processed images
-                        for img_file in media_dir.iterdir():
-                            if img_file.name.startswith("processed_"):
-                                # Create new relationship
-                                new_rel = ET.Element('Relationship', attrib={
-                                    'Id': 'rId' + str(len(rels_root) + 1000),  # Generate unique ID
-                                    'Type': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
-                                    'Target': f'media/{img_file.name}'
-                                })
-                                rels_root.append(new_rel)
-                        
-                        rels_tree.write(str(rels_file), encoding='utf-8', xml_declaration=True)
-                        
-                except Exception:
-                    pass
 
         # Repack DOCX
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -1044,9 +1089,14 @@ def main():
     # Load patterns once
     patterns = load_patterns()
 
-    # Defaults: all OCR languages, always include images
-    ocr_langs = "eng+chi_sim+chi_tra"
-    include_images = True
+    # OCR language selection
+    st.sidebar.subheader("OCR Settings")
+    ocr_langs = st.sidebar.text_input("Tesseract Languages", value="eng+chi_sim+chi_tra", 
+                                     help="Language codes separated by '+' (e.g., eng+chi_sim+chi_tra)")
+    
+    # Image processing option
+    include_images = st.sidebar.checkbox("Process Images", value=True, 
+                                       help="Enable OCR-based pattern detection in images")
 
     if mode == "Single File":
         single_file_page(patterns, ocr_langs, include_images)
