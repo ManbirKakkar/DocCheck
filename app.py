@@ -21,6 +21,7 @@ from copy import deepcopy
 import math
 import logging
 from PIL import Image
+import io
 
 # Try to import additional OCR engines
 try:
@@ -276,6 +277,7 @@ def tesseract_ocr(image, languages, whitelist):
         logger.error(f"Tesseract OCR failed: {e}")
         return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
 
+
 def paddle_ocr(image, languages):
     """Perform OCR using PaddleOCR if available"""
     if not PADDLEOCR_AVAILABLE:
@@ -285,11 +287,16 @@ def paddle_ocr(image, languages):
         # Convert to RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        # Initialize PaddleOCR
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', use_gpu=False)
+        # Initialize PaddleOCR with updated API
+        try:
+            # Try with new parameter name
+            ocr = PaddleOCR(use_textline_orientation=True, lang='en', show_log=False)
+        except TypeError:
+            # Fallback to old parameter name if new one doesn't work
+            ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
         
-        # Perform OCR
-        result = ocr.ocr(image_rgb, cls=True)
+        # Perform OCR with updated API
+        result = ocr.ocr(image_rgb)
         
         # Process results
         texts = []
@@ -299,13 +306,17 @@ def paddle_ocr(image, languages):
         heights = []
         confs = []
         
+        if result is None:
+            return {'text': [], 'left': [], 'top': [], 'width': [], 'height': [], 'conf': []}
+            
         for line in result:
             if line is None:
                 continue
             for item in line:
                 if item is None:
                     continue
-                points, (text, conf) = item
+                points = item[0]
+                text, conf = item[1]
                 if not text.strip():
                     continue
                 
@@ -533,7 +544,10 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
                 # Find all matches in this text segment
                 found_matches = list(regex.finditer(text))
                 if found_matches:
-                    matches_found += len(found_matches)
+                    for match in found_matches:
+                        # Log detected pattern for debugging
+                        logger.info(f"Detected pattern: {match.group(0)}")
+                        matches_found += 1
                     
                     # Apply replacements to each match
                     new_text = text
@@ -573,38 +587,70 @@ def process_image_bytes(image_bytes: bytes, languages: str, compiled_patterns: l
         logger.error(f"Image processing failed: {e}")
         return image_bytes, image_bytes, 0, 0
 
+
+
 def insert_image_after_original(doc, img_path, rel_id, new_img_path, new_rel_id):
     """
-    Insert a new image after the original image in the document XML
+    Enhanced to handle images in tables and complex layouts
     """
     W_NAMESPACE = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-    ns = {'w': W_NAMESPACE}
+    WP_NAMESPACE = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+    A_NAMESPACE = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    ns = {
+        'w': W_NAMESPACE,
+        'wp': WP_NAMESPACE,
+        'a': A_NAMESPACE
+    }
     
-    # Find all paragraphs containing the original image
-    for p in doc.findall('.//w:p', ns):
-        for r in p.findall('w:r', ns):
-            drawing = r.find('.//w:drawing', ns)
-            if drawing is not None:
-                # Check if this is the original image
-                blip = drawing.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
-                if blip is not None and blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed') == rel_id:
-                    # Create a new paragraph with the new image
-                    new_p = ET.Element(f"{{{W_NAMESPACE}}}p")
-                    
-                    # Copy the run and update to point to the new image
-                    new_r = deepcopy(r)
-                    new_blip = new_r.find('.//a:blip', {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'})
-                    if new_blip is not None:
-                        new_blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rel_id)
-                    
-                    new_p.append(new_r)
-                    
-                    # Insert the new paragraph after the current paragraph
-                    parent = p.getparent()
-                    index = list(parent).index(p)
-                    parent.insert(index + 1, new_p)
-                    return True
+    # Find all drawings containing the original image
+    drawings = []
+    for drawing in doc.findall('.//w:drawing', ns):
+        blip = drawing.find('.//a:blip', ns)
+        if blip is not None and blip.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed') == rel_id:
+            drawings.append(drawing)
+    
+    # Process each matching drawing
+    for drawing in drawings:
+        # Find parent run
+        parent = next((e for e in doc.iter() if drawing in list(e)), None)
+        if parent is None:
+            continue
+            
+        # Find grandparent (paragraph or table cell)
+        grandparent = next((e for e in doc.iter() if parent in list(e)), None)
+        if grandparent is None:
+            continue
+            
+        # Create a new paragraph with the new image
+        new_p = ET.Element(f"{{{W_NAMESPACE}}}p")
+        
+        # Create a new run and copy the drawing element
+        new_r = ET.Element(f"{{{W_NAMESPACE}}}r")
+        new_drawing = deepcopy(drawing)
+        
+        # Update the relationship ID in the copied drawing
+        new_blip = new_drawing.find('.//a:blip', ns)
+        if new_blip is not None:
+            new_blip.set('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed', new_rel_id)
+        
+        new_r.append(new_drawing)
+        new_p.append(new_r)
+        
+        # Insert after the current element
+        if grandparent.tag == f'{{{W_NAMESPACE}}}p':
+            # Find parent of grandparent (usually body or table cell)
+            great_grandparent = next((e for e in doc.iter() if grandparent in list(e)), None)
+            if great_grandparent is not None:
+                index = list(great_grandparent).index(grandparent)
+                great_grandparent.insert(index + 1, new_p)
+                return True
+        elif grandparent.tag == f'{{{W_NAMESPACE}}}tc':
+            # Insert directly into table cell
+            grandparent.append(new_p)
+            return True
+            
     return False
+
 
 def replace_patterns_in_docx(
     input_path: str,
@@ -743,8 +789,8 @@ def replace_patterns_in_docx(
                                     p.append(new_r)
                 # Save XML
                 tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"Error processing text part {rel}: {e}")
             step += 1
             if progress_callback:
                 percent = int(round(100 * step / total_steps))
@@ -775,7 +821,8 @@ def replace_patterns_in_docx(
                             if 'image' in relationship.get('Type', ''):
                                 rels_map[relationship.get('Id')] = relationship.get('Target')
                         rels_maps[str(rels_file)] = rels_map
-                    except Exception:
+                    except Exception as e:
+                        logger.error(f"Error reading relationships for {rel}: {e}")
                         rels_maps[str(rels_file)] = {}
             
             # Process each image
@@ -820,7 +867,7 @@ def replace_patterns_in_docx(
                                         
                                         # Create new relationship ID
                                         new_rel_id = f"rId{len(rels_root) + 1000}"
-                                        ns = {'': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+                                        ns_rel = {'': 'http://schemas.openxmlformats.org/package/2006/relationships'}
                                         ET.SubElement(
                                             rels_root, 
                                             'Relationship', 
@@ -840,12 +887,14 @@ def replace_patterns_in_docx(
                                         inserted = insert_image_after_original(root, img_file.name, orig_rel_id, new_img_name, new_rel_id)
                                         if inserted:
                                             tree.write(str(xml_file), encoding='utf-8', xml_declaration=True)
+                                        else:
+                                            logger.warning(f"Failed to insert new image for {img_file.name} in {rel}")
                                             
                                     except Exception as e:
-                                        pass
+                                        logger.error(f"Error updating relationships for {img_file.name}: {e}")
                         
                     except Exception as e:
-                        pass
+                        logger.error(f"Error processing image {img_file.name}: {e}")
                     step += 1
                     if progress_callback:
                         percent = int(round(100 * step / total_steps))
@@ -890,7 +939,7 @@ def load_patterns():
         st.write("or")
     manual = st.sidebar.text_area(
         "Manual patterns (JSON list)", height=150,
-        help='Example: [ {"pattern": "77-([A-Za-z0-9]{2,4})-(\\d{5,7})(?:-([A-Za-z0-9]{2,4}))?", "replacement": ""} ]\n'
+        help='Example: [ {"pattern": "77-([A-Za-z0-9]{2,10})-(\\d{5,10})(?:-([A-Za-z0-9]{2,10}))?", "replacement": ""} ]\n'
              'If "replacement" is omitted or empty, default logic is used for default pattern.',
         key="patterns_manual"
     )
@@ -915,8 +964,9 @@ def load_patterns():
             patterns = []
     # Default if none or invalid
     if not patterns:
-        st.sidebar.info("Using default pattern: 77-(2–4 chars)-(5–7 chars)-optional(2–4 chars) → append 4022-...")
-        default_pattern = r"77\s*[-–—]?\s*([A-Za-z0-9]{2,4})\s*[-–—]?\s*([A-Za-z0-9]{5,7})(?:\s*[-–—]?\s*([A-Za-z0-9]{2,4}))?"
+        st.sidebar.info("Using enhanced pattern: Detects all 77-XXXX-XXXXX variations")
+        # Enhanced pattern to handle all observed variations
+        default_pattern = r"77\s*[-–—]?\s*([A-Za-z0-9]{2,10})\s*[-–—]?\s*([A-Za-z0-9]{5,10})(?:\s*[-–—]?\s*([A-Za-z0-9]{2,10}))?"
         def default_repl(m):
             g1 = m.group(1)
             g2 = m.group(2)
@@ -1388,13 +1438,15 @@ def comparison_page():
                                 with c1:
                                     st.text(f"Original Image {i+1}")
                                     if i < len(res['orig_images']):
-                                        st.image(res['orig_images'][i], use_container_width=True)
+                                        img = Image.open(io.BytesIO(res['orig_images'][i]))
+                                        st.image(img, use_container_width=True)
                                     else:
                                         st.write("No image")
                                 with c2:
                                     st.text(f"Processed Image {i+1}")
                                     if i < len(res['proc_images']):
-                                        st.image(res['proc_images'][i], use_container_width=True)
+                                        img = Image.open(io.BytesIO(res['proc_images'][i]))
+                                        st.image(img, use_container_width=True)
                                     else:
                                         st.write("No image")
                                 st.markdown("---")
