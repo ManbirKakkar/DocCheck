@@ -10,7 +10,7 @@ import re
 
 def extract_table_data(text):
     """
-    Extract component, required quantity, and storage bin from reservation items table
+    Extract all fields from reservation items table
     """
     # Normalize text for robust matching
     text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces
@@ -23,31 +23,23 @@ def extract_table_data(text):
     # Extract table section - everything after "reservation item"
     table_section = text[start_idx + len("reservation item"):]
     
-    # Find all components with pattern: 4digits.3digits.5digits
-    components = re.findall(r'\b(\d{4}\.\d{3}\.\d{5})\b', table_section)
-    
-    # Find storage bins - look for all-caps words after quantity columns
-    bin_pattern = r'(\b[A-Z]{3,}\b)(?!.*\b[A-Z]{3,}\b)'
-    bins = re.findall(bin_pattern, table_section)
-    
-    # Find quantities - decimal numbers with 3 decimal places
-    quantities = re.findall(r'\b(\d\.\d{3})\b', table_section)
-    
-    # If we found fewer quantities than components, fill with 1.000
-    if len(quantities) < len(components):
-        quantities = quantities + ["1.000"] * (len(components) - len(quantities))
+    # Find all table rows using comprehensive pattern
+    row_pattern = r'(\d{4})\s+(\d{4}\.\d{3}\.\d{5})\s+(.*?)\s+(\d+\.\d{3})\s+(\d+\.\d{3})\s*(\S*)\s+(\S+)\s+(\S+)\s+(\S+)'
+    rows = re.findall(row_pattern, table_section)
     
     # Prepare the data
     data = []
-    for i, comp in enumerate(components):
-        # Get corresponding storage bin (use last found if not enough)
-        bin_val = bins[i] if i < len(bins) else (bins[-1] if bins else "UNKNOWN")
-        qty_val = quantities[i] if i < len(quantities) else "1.000"
-        
+    for row in rows:
         data.append({
-            "Component": comp,
-            "Req Qty": qty_val,
-            "Storage Bin": bin_val
+            "Reservation Item": row[0],
+            "Component": row[1],
+            "Description": row[2],
+            "Req Qty": row[3],
+            "Comm Qty": row[4],
+            "Pick Qty": row[5],
+            "UoM": row[6],
+            "Cd": row[7],
+            "Storage Bin": row[8]
         })
     
     return data
@@ -97,7 +89,7 @@ if uploaded_file:
         st.text("Common issues:")
         st.text("- Poor image quality")
         st.text("- Component numbers not in 4.3.5 digit format")
-        st.text("- No storage bins detected")
+        st.text("- Table structure not recognized")
 
 st.markdown("""
 **Requirements:**
