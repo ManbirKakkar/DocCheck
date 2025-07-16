@@ -10,47 +10,55 @@ import re
 
 def extract_table_data(text):
     """
-    Extract component, required quantity, and storage bin from reservation items table
+    Extract all fields from reservation items table with robust matching
     """
+    # Enhanced diagnostic logging
+    diagnostics = []
+    diagnostics.append(f"Original text length: {len(text)} characters")
+    
     # Normalize text for robust matching
     text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces
+    diagnostics.append(f"Normalized text length: {len(text)} characters")
     
-    # Find the reservation items section
-    start_idx = text.lower().find("reservation item")
-    if start_idx == -1:
-        return []
+    # More flexible header detection - handles OCR errors
+    header_pattern = r'(\S{0,5}ation\s*item|item\s*list|component\s*list)'
+    match = re.search(header_pattern, text, re.IGNORECASE)
     
-    # Extract table section - everything after "reservation item"
-    table_section = text[start_idx + len("reservation item"):]
-    
-    # Find all components with pattern: 4digits.3digits.5digits
-    components = re.findall(r'\b(\d{4}\.\d{3}\.\d{5})\b', table_section)
-    
-    # Find storage bins - look for all-caps words after quantity columns
-    bin_pattern = r'(\b[A-Z]{3,}\b)(?!.*\b[A-Z]{3,}\b)'
-    bins = re.findall(bin_pattern, table_section)
-    
-    # Find quantities - decimal numbers with 3 decimal places
-    quantities = re.findall(r'\b(\d\.\d{3})\b', table_section)
-    
-    # If we found fewer quantities than components, fill with 1.000
-    if len(quantities) < len(components):
-        quantities = quantities + ["1.000"] * (len(components) - len(quantities))
-    
-    # Prepare the data
-    data = []
-    for i, comp in enumerate(components):
-        # Get corresponding storage bin (use last found if not enough)
-        bin_val = bins[i] if i < len(bins) else (bins[-1] if bins else "UNKNOWN")
-        qty_val = quantities[i] if i < len(quantities) else "1.000"
+    if match:
+        diagnostics.append(f"✅ Header found: '{match.group()}' at position {match.start()}")
+        table_section = text[match.end():]
+        diagnostics.append(f"Table section length: {len(table_section)} characters")
         
-        data.append({
-            "Component": comp,
-            "Req Qty": qty_val,
-            "Storage Bin": bin_val
-        })
+        # Find all table rows using comprehensive pattern
+        row_pattern = r'(\d{4})\s+(\d{4}\.\d{3}\.\d{5})\s+(.*?)\s+(\d+\.\d{3})\s+(\d+\.\d{3})\s*(\S*)\s+(\S+)\s+(\S+)\s+(\S+)'
+        rows = re.findall(row_pattern, table_section)
+        diagnostics.append(f"Found {len(rows)} rows with primary pattern")
+        
+        # If no rows found, try alternative pattern
+        if not rows:
+            alt_pattern = r'(\d{4})\s+(\d{4}\.\d{3}\.\d{5})\s+(.*?)\s+(\d+\.\d{3})\s+(\d+\.\d{3})\s+(\S*)\s+(\S+)\s+(\S+)\s+(\S+)'
+            rows = re.findall(alt_pattern, table_section)
+            diagnostics.append(f"Found {len(rows)} rows with alternative pattern")
+        
+        # Prepare the data
+        data = []
+        for row in rows:
+            data.append({
+                "Reservation Item": row[0],
+                "Component": row[1],
+                "Description": row[2].strip(),
+                "Req Qty": row[3],
+                "Comm Qty": row[4],
+                "Pick Qty": row[5],
+                "UoM": row[6],
+                "Cd": row[7],
+                "Storage Bin": row[8]
+            })
+        
+        return data, diagnostics
     
-    return data
+    diagnostics.append("❌ Header not found")
+    return [], diagnostics
 
 # Streamlit UI
 st.title("Production Work Order Data Extractor")
@@ -72,8 +80,32 @@ if uploaded_file:
     with st.expander("View Extracted Text"):
         st.text(text)
     
-    # Process data
-    table_data = extract_table_data(text)
+    # Process data with diagnostics
+    table_data, diagnostics = extract_table_data(text)
+    
+    # Show diagnostic information
+    with st.expander("Diagnostic Information"):
+        st.subheader("Extraction Process Details")
+        for line in diagnostics:
+            st.text(line)
+        
+        # Show component patterns found
+        components = re.findall(r'\b\d{4}\.\d{3}\.\d{5}\b', text)
+        st.subheader(f"Component Patterns Found: {len(components)}")
+        if components:
+            st.write(f"First component: {components[0]}")
+        
+        # Show quantities found
+        quantities = re.findall(r'\b\d+\.\d{3}\b', text)
+        st.subheader(f"Quantities Found: {len(quantities)}")
+        if quantities:
+            st.write(f"First quantity: {quantities[0]}")
+        
+        # Show potential headers found
+        headers = re.findall(r'\S{0,5}ation\s*item|item\s*list|component\s*list', text, re.IGNORECASE)
+        st.subheader(f"Potential Headers Found: {len(headers)}")
+        if headers:
+            st.write(f"Headers: {', '.join(headers)}")
     
     if table_data:
         # Show JSON output
@@ -93,11 +125,11 @@ if uploaded_file:
             mime="application/json"
         )
     else:
-        st.error("No reservation items found. Check extracted text for issues.")
-        st.text("Common issues:")
-        st.text("- Poor image quality")
-        st.text("- Component numbers not in 4.3.5 digit format")
-        st.text("- No storage bins detected")
+        st.error("No reservation items found. Check diagnostic information below.")
+        st.text("Common solutions:")
+        st.text("- Try a higher quality image")
+        st.text("- Ensure the table is visible and well-lit")
+        st.text("- Check if the header appears in the extracted text")
 
 st.markdown("""
 **Requirements:**
